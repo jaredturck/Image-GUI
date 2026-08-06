@@ -18,7 +18,7 @@ The planner preserves the existing tuned dual-RTX-3090 loading paths and adds po
 - Fresh-process retries after CUDA, MPS, or CPU allocation failures
 - Per-machine plan history in `config/plan_history.json`
 - Current loading plan shown inside model GUIs
-- Persistent user paths for the Hugging Face cache, ComfyUI, and output root
+- Persistent user paths for the Hugging Face cache, ComfyUI, and media output root
 - GUI-based two-environment installer for the application and optional ComfyUI backend
 
 ## Installation
@@ -84,7 +84,25 @@ Windows:
 .venv\Scripts\python.exe gui.py
 ```
 
-On first launch, the application asks for optional paths such as the Hugging Face cache and output root. A successfully installed managed ComfyUI path is written automatically to `config/user_config.json`.
+On first launch, the application asks for optional paths such as the Hugging Face cache and media output root. A successfully installed managed ComfyUI path is written automatically to `config/user_config.json`.
+
+When the media output root is left blank, generated files are stored under the project-local `media` directory:
+
+```text
+media/
+├── images/
+│   ├── flux_1/
+│   ├── flux_2/
+│   ├── qwen_image/
+│   └── ...
+└── videos/
+    ├── skyreels_v2/
+    ├── cogvideox/
+    ├── hunyuan_video_1_5/
+    └── ...
+```
+
+Each model keeps its generated files and `prompts.json` inside its own canonical model folder. Setting a custom media output root preserves the same `images/` and `videos/` organization under the selected directory. Existing legacy output folders in the project root are left untouched; only newly generated media uses the organized structure.
 
 ## Hardware planning
 

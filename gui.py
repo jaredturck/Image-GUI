@@ -136,7 +136,7 @@ class SettingsDialog:
 
         description = ctk.CTkLabel(
             self.window,
-            text="These paths are optional. Leave a field blank to use the normal project or library default.",
+            text="These paths are optional. Leave Output root blank to store generated media in the project media folder.",
             text_color="#a8a8a8",
             anchor="w",
         )
@@ -148,7 +148,7 @@ class SettingsDialog:
 
         self.add_path_row(form, 0, "huggingface_cache_dir", "Hugging Face cache")
         self.add_path_row(form, 1, "comfyui_dir", "ComfyUI directory")
-        self.add_path_row(form, 2, "output_root", "Output root")
+        self.add_path_row(form, 2, "output_root", "Media output root")
 
         buttons = ctk.CTkFrame(self.window, fg_color="transparent")
         buttons.grid(row=3, column=0, sticky="e", padx=20, pady=(0, 18))
