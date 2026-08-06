@@ -15,7 +15,6 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
 from pynvml import nvmlInit, nvmlDeviceGetCount, nvmlDeviceGetHandleByIndex, nvmlDeviceGetUtilizationRates
 from pynvml import nvmlDeviceGetCurrentClocksThrottleReasons
 from pynvml import nvmlClocksThrottleReasonHwThermalSlowdown, nvmlClocksThrottleReasonSwThermalSlowdown
-from comfy_script.runtime import Workflow, util
 import io, shutil, subprocess
 from planner_runtime import clear_accelerator_cache, get_active_plan, is_exact_fast_path, mark_success, preview_device, run_guarded, workload_from_diffusion_gui
 
@@ -1415,6 +1414,8 @@ class DiffusionGUI:
     
     def generate_comfy(self):
         if self.backend == "comfy":
+            from comfy_script.runtime import Workflow, util
+
             with self.model_lock:
                 nodes = self.comfy_nodes
                 model, clip = self.pipe

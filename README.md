@@ -19,86 +19,67 @@ The planner preserves the existing tuned dual-RTX-3090 loading paths and adds po
 - Per-machine plan history in `config/plan_history.json`
 - Current loading plan shown inside model GUIs
 - Persistent user paths for the Hugging Face cache, ComfyUI, and output root
-- GUI-based Python dependency installer
+- GUI-based two-environment installer for the application and optional ComfyUI backend
 
 ## Installation
 
 ### 1. Install Python
 
-Use a current 64-bit Python 3.10 or newer release supported by PyTorch and the model libraries. Python, pip, and Tkinter must already be available before running the installer. Tkinter normally ships with Windows and macOS Python installers; some Linux distributions provide it separately as a package such as `python3-tk`.
+Install a current 64-bit Python 3.10 or newer release supported by PyTorch and the model libraries. The installer itself uses only the Python standard library, including Tkinter and `venv`.
 
-A virtual environment is strongly recommended:
-
-```bash
-python -m venv .venv
-```
-
-Activate it before continuing.
-
-Linux or macOS:
-
-```bash
-source .venv/bin/activate
-```
-
-Windows PowerShell:
-
-```powershell
-.venv\Scripts\Activate.ps1
-```
+You do not need to create or activate a virtual environment manually.
 
 ### 2. Run the GUI installer
+
+From the project directory:
 
 ```bash
 python install.py
 ```
 
-The installer detects the operating system and whether NVIDIA hardware is visible, then installs:
+The installer creates two hidden project-local environments:
 
-- one of `requirements-cuda.txt`, `requirements-cpu.txt`, or `requirements-macos.txt`
-- `requirements.txt`
-- optionally `requirements-vllm.txt` on CUDA Linux
+- `.venv` — the main AI Workstation and model dependencies
+- `.comfy_venv` — the optional managed ComfyUI backend
 
-The installer only installs Python packages through pip. It does not install operating-system packages, GPU drivers, CUDA drivers, FFmpeg, PortAudio, or ComfyUI.
+The installation is split into clear pages:
 
-### 3. Install external prerequisites
+1. Detect the operating system and CUDA, MPS, or CPU backend.
+2. Create or update `.venv` and install the main requirements.
+3. Optionally download and install the pinned ComfyUI backend into `runtime/ComfyUI` using `.comfy_venv`.
+4. Show a completion page with **Launch AI Workstation** and **Close**.
 
-Install these separately where relevant:
+If ComfyUI installation fails, choose **Retry ComfyUI** or **Continue Without ComfyUI**. The failure does not prevent other image, video, utility, or chat models from being used.
+
+The installer also creates `.env` with a secure chat-history key when no `.env` exists. Existing `.env` files are preserved.
+
+### 3. External system software
+
+The installer does not install operating-system packages or drivers. Install these separately where relevant:
 
 - **FFmpeg** for video encoding, decoding, and preview operations
 - **PortAudio** for microphone capture through SoundDevice
 - **NVIDIA drivers** for CUDA systems
-- **ComfyUI and comfy-script support** for the Anima workflow
 
-Use the package manager appropriate for the operating system. The installer reports external prerequisites it cannot detect, but does not modify the system automatically.
+Missing external tools are reported in the installer but do not stop Python dependency installation.
 
-### 4. Configure the environment
+### 4. Launch the application
 
-Copy `.env.example` to `.env` and provide the required chat-history key:
+Use **Launch AI Workstation** on the final installer page, or start it later with the managed application environment.
 
-```bash
-cp .env.example .env
-```
-
-`CHAT_HISTORY_KEY_B64` must contain a Base64-encoded 32-byte key. One can be generated with:
+Linux or macOS:
 
 ```bash
-python -c "import base64, os; print(base64.b64encode(os.urandom(32)).decode())"
+./.venv/bin/python gui.py
 ```
 
-### 5. Start the application
+Windows:
 
-```bash
-python gui.py
+```powershell
+.venv\Scripts\python.exe gui.py
 ```
 
-On first launch, the application asks for optional paths:
-
-- Hugging Face cache directory
-- ComfyUI directory
-- Output root
-
-These settings are stored in `config/user_config.json` and can be changed later with the **Settings** button. On Jared's existing Linux workstation, the known `/mnt/8TB_HDD/hf_cache` and `/home/jared/comfy/ComfyUI` paths are detected automatically when present.
+On first launch, the application asks for optional paths such as the Hugging Face cache and output root. A successfully installed managed ComfyUI path is written automatically to `config/user_config.json`.
 
 ## Hardware planning
 
@@ -184,15 +165,17 @@ A repository authentication failure is reported as an ordinary model error, not 
 
 ## Anima and ComfyUI
 
-The Anima workflow continues to use the existing ComfyUI integration and expects the configured ComfyUI installation and model files to be available. The application does not download or install ComfyUI automatically.
+The installer can download and manage a pinned ComfyUI release under `runtime/ComfyUI`. Its Python dependencies are installed separately in `.comfy_venv`, while the main application environment installs ComfyScript with its required `default` dependency set. When Anima is launched, the application starts the managed ComfyUI backend as a local background process and connects to it through ComfyScript.
 
-The workflow currently expects the existing component names used by the application:
+ComfyUI is optional. If its setup fails or is skipped, the installer still completes and the rest of the AI Workstation remains available.
+
+The Anima workflow still expects these model component names inside the configured ComfyUI model directories:
 
 - `anima-preview.safetensors`
 - `qwen_3_06b_base.safetensors`
 - `qwen_image_vae.safetensors`
 
-Set the ComfyUI directory from the launcher Settings window.
+Those model weights are not included in the project archive.
 
 ## Requirements files
 
@@ -210,6 +193,7 @@ Runtime state is created under `config/`:
 
 - `user_config.json` — paths and reserve settings
 - `plan_history.json` — successful and failed plan records
+- `installation.json` — managed environment and optional-backend installation state
 - `active_plans/` — concrete launch plans
 - `planner_results/` — child-process result records
 
@@ -230,7 +214,8 @@ These files are excluded by `.gitignore`.
 - `planner_protocol.py` — child-process result and OOM protocol
 - `plan_history.py` — validated and failed plan persistence
 - `app_config.py` — paths, reserves, and environment configuration
-- `install.py` — GUI pip installer
+- `install.py` — standard-library GUI installer for the managed application and ComfyUI environments
+- `comfy_backend.py` — starts and stops the isolated local ComfyUI process used by Anima
 
 ## Troubleshooting
 

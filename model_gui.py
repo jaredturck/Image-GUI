@@ -20,7 +20,7 @@ from diffusers import DiffusionPipeline, AllegroPipeline, AutoencoderKLAllegro, 
 from base_gui import DiffusionGUI
 from vram_estimation import Kandinsky5I2VProVramEstimator
 from model_loading import Flux2Generator, GLMImageGenerator, QwenImageGenerator, QwenImageEditGenerator, ChronoEditGenerator, Kandinsky5I2VGenerator
-from comfy_script.runtime import nodes, load
+from comfy_backend import connect_comfy_backend
 import os, time
 from diffusers import AutoModel, SkyReelsV2DiffusionForcingPipeline, UniPCMultistepScheduler
 from diffusers.utils import export_to_video
@@ -179,7 +179,7 @@ class AnimaGUI(DiffusionGUI):
                 return
             self.model_loading = True
 
-        load(self.comfyui_dir)
+        nodes = connect_comfy_backend(self.comfyui_dir)
         
         model = nodes.UNETLoader(self.unet_name, "default")
         clip = nodes.CLIPLoader(self.clip_name, self.clip_type, "default")
