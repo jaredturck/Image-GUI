@@ -1,12 +1,13 @@
-import os, dotenv
+import os
+import dotenv
 
 dotenv.load_dotenv()
-if os.environ['USE_HHD'] == 'True':
-    os.environ["HF_HOME"] = "/mnt/8TB_HDD/hf_cache"
-    os.environ["HF_HUB_CACHE"] = "/mnt/8TB_HDD/hf_cache/hub"
-    os.environ["TRANSFORMERS_CACHE"] = "/mnt/8TB_HDD/hf_cache/hub"
 
-import os, sys, json, threading, time, gc, re, base64, queue, io, asyncio, uuid
+from app_config import apply_runtime_environment
+
+apply_runtime_environment()
+
+import sys, json, threading, time, gc, re, base64, queue, io, asyncio, uuid
 import numpy as np
 import torch
 import sounddevice as sd
@@ -16,10 +17,20 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from transformers import AutoTokenizer, pipeline, BitsAndBytesConfig, TextIteratorStreamer, StoppingCriteria, StoppingCriteriaList
-from vllm import SamplingParams
-from vllm.engine.arg_utils import AsyncEngineArgs
-from vllm.sampling_params import RequestOutputKind
-from vllm.v1.engine.async_llm import AsyncLLM
+try:
+    from vllm import SamplingParams
+    from vllm.engine.arg_utils import AsyncEngineArgs
+    from vllm.sampling_params import RequestOutputKind
+    from vllm.v1.engine.async_llm import AsyncLLM
+    VLLM_AVAILABLE = True
+except ImportError:
+    SamplingParams = None
+    AsyncEngineArgs = None
+    RequestOutputKind = None
+    AsyncLLM = None
+    VLLM_AVAILABLE = False
+
+from planner_runtime import clear_accelerator_cache, execution_device, get_active_plan, is_exact_fast_path, mark_success, run_guarded, secondary_device, transformers_model_kwargs, vllm_engine_overrides, workload_from_chat_gui
 
 def get_flag_value(flag):
     if flag in sys.argv:
@@ -117,8 +128,11 @@ class ChatGUI:
         ctk.set_appearance_mode("Dark")
         ctk.set_default_color_theme("blue")
 
+        self.active_plan = get_active_plan()
         if model_id == "Qwen/Qwen3.6-35B-A3B":
             model_id = "Qwen/Qwen3.6-35B-A3B-FP8"
+        if self.active_plan.get("runtime_model_id"):
+            model_id = self.active_plan["runtime_model_id"]
 
         self.model_id = model_id or "unknown-model"
         self.base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -162,6 +176,13 @@ class ChatGUI:
         self.top_p = 0.95
         self.max_context_messages = 16
 
+        if self.active_plan.get("restore_workload"):
+            retry_workload = self.active_plan.get("workload", {})
+            if isinstance(retry_workload.get("max_new_tokens"), (int, float)):
+                self.max_new_tokens = int(retry_workload["max_new_tokens"])
+            if isinstance(retry_workload.get("prompt_tokens"), (int, float)):
+                self.max_context_messages = max(1, int(retry_workload["prompt_tokens"] + 511) // 512)
+
         self.store = {}
         self.chat_ids = []
         self.selected_chat_id = None
@@ -186,6 +207,7 @@ class ChatGUI:
         self.chat_view = None
         self.model_title = None
         self.status_pill = None
+        self.plan_label = None
         self.input_box = None
         self.send_btn = None
         self.mic_btn = None
@@ -208,8 +230,25 @@ class ChatGUI:
         self.refresh_chat_list()
         self.select_chat(self.chat_ids[0] if self.chat_ids else None)
 
-        threading.Thread(target=self.load_model, daemon=True).start()
+        threading.Thread(target=self.load_model_guarded, daemon=True).start()
     
+    def load_model_guarded(self):
+        workload = workload_from_chat_gui(self)
+        return run_guarded(self.active_plan, "model_loading", workload, self.load_model)
+
+    def run_reply_guarded(self, chat_id):
+        workload = workload_from_chat_gui(self)
+        result = run_guarded(self.active_plan, "inference", workload, lambda: self.run_reply(chat_id))
+        if result is not False and not self.stop_generation:
+            mark_success(self.active_plan, workload)
+            self.app.after(0, self.set_plan_validated)
+        return result
+
+    def set_plan_validated(self):
+        if self.plan_label is not None:
+            plan_text = self.active_plan.get("status_text", "Legacy") if self.active_plan else "Legacy"
+            self.plan_label.configure(text=f"Plan: {plan_text} · Validated")
+
     def stop_message(self):
         self.stop_generation = True
         self.send_btn.configure(state="disabled")
@@ -514,6 +553,7 @@ class ChatGUI:
         header = ctk.CTkFrame(right, fg_color="transparent")
         header.grid(row=0, column=0, sticky="ew", padx=14, pady=(14, 8))
         header.grid_columnconfigure(0, weight=1)
+        header.grid_rowconfigure(1, weight=0)
 
         self.model_title = ctk.CTkLabel(header, text=self.model_id, font=ctk.CTkFont(size=18, weight="bold"))
         self.model_title.grid(row=0, column=0, sticky="w")
@@ -526,6 +566,12 @@ class ChatGUI:
 
         self.status_pill = ctk.CTkLabel(header, text="Loading...", corner_radius=999, fg_color="#333333", text_color="#d0d0d0", padx=10, pady=4)
         self.status_pill.grid(row=0, column=3, sticky="e")
+
+        plan_text = self.active_plan.get("status_text", "Legacy loading path") if self.active_plan else "Legacy loading path"
+        self.plan_label = ctk.CTkLabel(
+            header, text=f"Plan: {plan_text}", text_color="#a8a8a8", font=ctk.CTkFont(size=11), anchor="w"
+        )
+        self.plan_label.grid(row=1, column=0, columnspan=4, sticky="ew", pady=(4, 0))
 
         self.chat_view = ctk.CTkScrollableFrame(right, corner_radius=16)
         self.chat_view.grid(row=1, column=0, sticky="nsew", padx=14, pady=(0, 10))
@@ -1375,8 +1421,9 @@ class ChatGUI:
 
         p = None
         device_name = "CPU"
+        target_device = secondary_device(self.active_plan)
 
-        if torch.cuda.is_available() and torch.cuda.device_count() > 1:
+        if target_device == "cuda:1" and torch.cuda.is_available() and torch.cuda.device_count() > 1:
             self.app.after(0, self.set_status, "Loading voice model on GPU 1...")
 
             try:
@@ -1390,6 +1437,18 @@ class ChatGUI:
             except Exception:
                 p = None
                 self.clear_cuda_cache()
+        elif target_device == "mps":
+            self.app.after(0, self.set_status, "Loading voice model on Apple MPS...")
+            try:
+                p = pipeline(
+                    "automatic-speech-recognition",
+                    model=self.voice_model_id,
+                    device="mps",
+                    torch_dtype=torch.float16,
+                )
+                device_name = "MPS"
+            except Exception:
+                p = None
 
         if p is None:
             self.app.after(0, self.set_status, "Loading voice model on CPU...")
@@ -1503,12 +1562,20 @@ class ChatGUI:
     def set_send_enabled(self, enabled):
         self.send_btn.configure(state="normal" if enabled else "disabled")
 
+    def uses_vllm(self):
+        if self.model_id not in VLLM_MODEL_CONFIGS:
+            return False
+        if not self.active_plan:
+            return True
+        return self.active_plan.get("placement") in ["existing_code_path", "vllm_tensor_parallel"]
+
     async def create_vllm_engine(self):
-        config = VLLM_MODEL_CONFIGS[self.model_id]
-        engine_args = AsyncEngineArgs(
-            model=self.model_id,
-            **config,
-        )
+        if not VLLM_AVAILABLE:
+            raise RuntimeError("vLLM is required for this model. Run install.py and enable the vLLM requirements.")
+        config = dict(VLLM_MODEL_CONFIGS[self.model_id])
+        if self.active_plan:
+            config.update(vllm_engine_overrides(self.active_plan))
+        engine_args = AsyncEngineArgs(model=self.model_id, **config)
         return AsyncLLM.from_engine_args(engine_args)
 
     def load_model(self):
@@ -1520,7 +1587,7 @@ class ChatGUI:
         self.app.after(0, self.set_status, "Loading...")
         self.app.after(0, self.set_send_enabled, False)
 
-        if self.model_id in VLLM_MODEL_CONFIGS:
+        if self.uses_vllm():
             self.vllm_loop = asyncio.new_event_loop()
             asyncio.set_event_loop(self.vllm_loop)
             p = self.vllm_loop.run_until_complete(self.create_vllm_engine())
@@ -1528,42 +1595,31 @@ class ChatGUI:
             tokenizer_id = config.get("tokenizer", self.model_id)
             self.vllm_tokenizer = AutoTokenizer.from_pretrained(tokenizer_id)
         else:
-            model_kwargs = {
-                "dtype": torch.bfloat16,
-                "device_map": "balanced",
-                "max_memory": {
-                    0: "22GiB",
-                    1: "22GiB",
-                },
-            }
-
-            if self.model_id in ("LiquidAI/LFM2.5-1.2B-Thinking", "openai/gpt-oss-20b"):
-                model_kwargs["device_map"] = {"": "cuda:0"}
-
-            if self.model_id in CHAT_MODEL_CPU_OFFLOAD_IDS:
-                model_kwargs["max_memory"]["cpu"] = "80GiB"
-
-            quantization = CHAT_MODEL_QUANTIZATION.get(self.model_id)
-
-            if quantization == "8bit":
-                model_kwargs["quantization_config"] = BitsAndBytesConfig(
-                    load_in_8bit=True,
-                )
-            elif quantization == "4bit":
-                model_kwargs["quantization_config"] = BitsAndBytesConfig(
-                    load_in_4bit=True,
-                    bnb_4bit_quant_type="nf4",
-                    bnb_4bit_use_double_quant=True,
-                    bnb_4bit_compute_dtype=torch.bfloat16,
-                )
+            if self.active_plan and not is_exact_fast_path(self.active_plan):
+                model_kwargs = transformers_model_kwargs(self.active_plan)
+            else:
+                model_kwargs = {
+                    "dtype": torch.bfloat16,
+                    "device_map": "balanced",
+                    "max_memory": {0: "22GiB", 1: "22GiB"},
+                }
+                if self.model_id in ("LiquidAI/LFM2.5-1.2B-Thinking", "openai/gpt-oss-20b"):
+                    model_kwargs["device_map"] = {"": "cuda:0"}
+                if self.model_id in CHAT_MODEL_CPU_OFFLOAD_IDS:
+                    model_kwargs["max_memory"]["cpu"] = "80GiB"
+                quantization = CHAT_MODEL_QUANTIZATION.get(self.model_id)
+                if quantization == "8bit":
+                    model_kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
+                elif quantization == "4bit":
+                    model_kwargs["quantization_config"] = BitsAndBytesConfig(
+                        load_in_4bit=True,
+                        bnb_4bit_quant_type="nf4",
+                        bnb_4bit_use_double_quant=True,
+                        bnb_4bit_compute_dtype=torch.bfloat16,
+                    )
 
             pipeline_task = "image-text-to-text" if self.model_id in PROCESSOR_CHAT_MODEL_IDS else "text-generation"
-
-            p = pipeline(
-                pipeline_task,
-                model=self.model_id,
-                model_kwargs=model_kwargs,
-            )
+            p = pipeline(pipeline_task, model=self.model_id, model_kwargs=model_kwargs)
 
         with self.model_lock:
             self.pipe = p
@@ -1575,7 +1631,6 @@ class ChatGUI:
 
         self.app.after(0, self.set_status, "Ready")
         self.app.after(0, self.set_send_enabled, True)
-
         if self.vllm_loop is not None:
             self.vllm_loop.run_forever()
 
@@ -1590,8 +1645,10 @@ class ChatGUI:
 
         self.app.after(0, self.set_reasoning_status, "Loading...")
 
+        reasoning_device = execution_device(self.active_plan)
         if (
-            self.model_id in VLLM_MODEL_CONFIGS
+            not reasoning_device.startswith("cuda")
+            or self.model_id in VLLM_MODEL_CONFIGS
             or self.model_id == GEMMA_4_MODEL_ID
             or self.model_id == "Qwen/Qwen3.6-27B"
             or self.model_id == "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B"
@@ -1608,7 +1665,7 @@ class ChatGUI:
                     "text-generation",
                     model=self.reasoning_model_id,
                     model_kwargs={
-                        "device_map": {"": "cuda:0"},
+                        "device_map": {"": reasoning_device},
                         "quantization_config": BitsAndBytesConfig(
                             load_in_8bit=True,
                         ),
@@ -1858,7 +1915,7 @@ class ChatGUI:
 
         messages = self.build_context_messages()
 
-        if self.model_id in VLLM_MODEL_CONFIGS:
+        if self.uses_vllm():
             future = asyncio.run_coroutine_threadsafe(
                 self.collect_vllm_reply(messages),
                 self.vllm_loop,
@@ -1898,7 +1955,7 @@ class ChatGUI:
         self.reset_reasoning_summary()
         self.set_status("Generating...")
         self.send_btn.configure(text="Cancel", state="normal", command=self.stop_message)
-        threading.Thread(target=self.run_reply, args=(chat_id,), daemon=True).start()
+        threading.Thread(target=self.run_reply_guarded, args=(chat_id,), daemon=True).start()
 
     def finish_send(self, reply, dt, chat_id=None):
         self.append_message_only("assistant", reply, chat_id)
@@ -1916,11 +1973,11 @@ class ChatGUI:
 
         if p is None:
             self.app.after(0, self.finish_send, "(no response)", 0.0, chat_id)
-            return
+            return False
 
         messages = self.build_context_messages(chat_id)
 
-        if self.model_id in VLLM_MODEL_CONFIGS:
+        if self.uses_vllm():
             streamer = QueueTextStreamer()
             self.streamer = streamer
             self.stream_text = ""
@@ -1941,13 +1998,13 @@ class ChatGUI:
                 self.vllm_loop,
             )
             future.result()
-            return
+            return True
 
         tokenizer = getattr(p, "tokenizer", None)
         model = getattr(p, "model", None)
         if tokenizer is None or model is None:
             self.app.after(0, self.finish_send, "(no response)", 0.0, chat_id)
-            return
+            return False
 
         processor = getattr(p, "processor", None)
 
@@ -2000,8 +2057,9 @@ class ChatGUI:
             prompt = self.format_plain_prompt(messages)
             inputs = tokenizer(prompt, return_tensors="pt")
 
-        if torch.cuda.is_available():
-            inputs = {k: v.to("cuda:0") for k, v in inputs.items()}
+        target_device = execution_device(self.active_plan)
+        if target_device != "cpu":
+            inputs = {key: value.to(target_device) for key, value in inputs.items()}
 
         self.stream_t0 = time.time()
         self.app.after(100, self.poll_streamer)
@@ -2028,14 +2086,10 @@ class ChatGUI:
             else:
                 self.stop_reason = "complete"
 
+        return True
+
     def clear_cuda_cache(self):
-        gc.collect()
-        if not torch.cuda.is_available():
-            return
-        for i in range(torch.cuda.device_count()):
-            torch.cuda.set_device(i)
-            torch.cuda.empty_cache()
-            torch.cuda.ipc_collect()
+        clear_accelerator_cache()
 
     def run(self):
         self.app.mainloop()

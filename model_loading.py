@@ -42,32 +42,60 @@ from transformers import CLIPProcessor
 from transformers import CLIPVisionModel
 from transformers import UMT5EncoderModel
 from transformers import BitsAndBytesConfig
+from planner_runtime import build_block_device_map, clear_accelerator_cache, component_device_map, diffusers_quantization_config, execution_device, get_active_plan, is_cuda_plan, is_exact_fast_path, load_component, plan_max_memory, run_guarded, secondary_device, set_runtime_phase, torch_dtype, transformers_quantization_config
 
 class Flux2Generator:
-    def __init__(self):
+    def __init__(self, plan=None):
+        self.plan = plan or get_active_plan()
         self.model_id = "black-forest-labs/FLUX.2-dev"
-        self.max_memory = {0: "22GiB", 1: "22GiB", "cpu": "48GiB"}
+        self.primary_device = execution_device(self.plan)
+        self.secondary_device = secondary_device(self.plan)
+        self.max_memory = {0: "22GiB", 1: "22GiB", "cpu": "48GiB"} if is_exact_fast_path(self.plan) else plan_max_memory(self.plan)
 
-        self.transformer_device_map = {
-            "pos_embed": 0,
-            "time_guidance_embed": 0,
-            "double_stream_modulation_img": 0,
-            "double_stream_modulation_txt": 0,
-            "single_stream_modulation": 0,
-            "x_embedder": 0,
-            "context_embedder": 0,
-            "transformer_blocks": 0,
-            "norm_out": 1,
-            "proj_out": 1,
-        }
-
-        self.transformer_device_map.update({f"single_transformer_blocks.{index}": 0 for index in range(24)})
-        self.transformer_device_map.update({f"single_transformer_blocks.{index}": 1 for index in range(24, 48)})
+        if is_exact_fast_path(self.plan):
+            self.transformer_device_map = {
+                "pos_embed": 0,
+                "time_guidance_embed": 0,
+                "double_stream_modulation_img": 0,
+                "double_stream_modulation_txt": 0,
+                "single_stream_modulation": 0,
+                "x_embedder": 0,
+                "context_embedder": 0,
+                "transformer_blocks": 0,
+                "norm_out": 1,
+                "proj_out": 1,
+            }
+            self.transformer_device_map.update({f"single_transformer_blocks.{index}": 0 for index in range(24)})
+            self.transformer_device_map.update({f"single_transformer_blocks.{index}": 1 for index in range(24, 48)})
+        else:
+            self.transformer_device_map = build_block_device_map(
+                "single_transformer_blocks",
+                48,
+                fixed_first=[
+                    "pos_embed",
+                    "time_guidance_embed",
+                    "double_stream_modulation_img",
+                    "double_stream_modulation_txt",
+                    "single_stream_modulation",
+                    "x_embedder",
+                    "context_embedder",
+                    "transformer_blocks",
+                ],
+                fixed_last=["norm_out", "proj_out"],
+                plan=self.plan,
+            )
 
         self.processor = AutoProcessor.from_pretrained(self.model_id, subfolder="tokenizer")
         self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(self.model_id, subfolder="scheduler")
-        self.vae = AutoencoderKLFlux2.from_pretrained(self.model_id, subfolder="vae", torch_dtype=torch.bfloat16)
-
+        self.vae = load_component(
+            AutoencoderKLFlux2,
+            self.model_id,
+            "vae",
+            current_kwargs={"subfolder": "vae", "torch_dtype": torch.bfloat16},
+            portable_base_kwargs={"subfolder": "vae"},
+            plan=self.plan,
+            portable_device_map={"": "cpu"},
+        )
         self.vae.eval()
         self.vae.enable_tiling()
 
@@ -77,21 +105,27 @@ class Flux2Generator:
         self.text_encoder = self.load_text_encoder()
 
     def load_text_encoder(self):
-        text_encoder = Mistral3ForConditionalGeneration.from_pretrained(
-            self.model_id,
-            subfolder="text_encoder",
-            torch_dtype=torch.bfloat16,
-            quantization_config=BitsAndBytesConfig(
-                load_in_8bit=True,
-                llm_int8_threshold=6.0,
-                llm_int8_skip_modules=["lm_head"],
-            ),
-            device_map="balanced",
-            max_memory=self.max_memory
+        set_runtime_phase(self.plan, "text_encoder_loading")
+        current_quantization = BitsAndBytesConfig(
+            load_in_8bit=True,
+            llm_int8_threshold=6.0,
+            llm_int8_skip_modules=["lm_head"],
         )
-
-        text_encoder.eval()
-        return text_encoder
+        return load_component(
+            Mistral3ForConditionalGeneration,
+            self.model_id,
+            "text_encoder",
+            current_kwargs={
+                "subfolder": "text_encoder",
+                "torch_dtype": torch.bfloat16,
+                "quantization_config": current_quantization,
+                "device_map": "balanced",
+                "max_memory": self.max_memory,
+            },
+            portable_base_kwargs={"subfolder": "text_encoder"},
+            shardable=True,
+            plan=self.plan,
+        ).eval()
 
     def preload_text_encoder(self):
         with self.text_encoder_lock:
@@ -102,7 +136,12 @@ class Flux2Generator:
         threading.Thread(target=self.finish_text_encoder_preload, daemon=True).start()
 
     def finish_text_encoder_preload(self):
-        text_encoder = self.load_text_encoder()
+        text_encoder = run_guarded(
+            self.plan,
+            "text_encoder_preload",
+            self.plan.get("workload", {}),
+            self.load_text_encoder,
+        )
 
         with self.text_encoder_lock:
             keep_text_encoder = self.preload_enabled
@@ -113,7 +152,7 @@ class Flux2Generator:
         if not keep_text_encoder:
             del text_encoder
             gc.collect()
-            torch.cuda.empty_cache()
+            clear_accelerator_cache()
 
     def prepare_next_generation(self):
         self.preload_text_encoder()
@@ -132,73 +171,89 @@ class Flux2Generator:
             del text_encoder
 
         gc.collect()
-        torch.cuda.empty_cache()
+        clear_accelerator_cache()
 
     def encode_prompt(self, text_encoder, prompt, max_sequence_length):
         return Flux2Pipeline._get_mistral_3_small_prompt_embeds(
             text_encoder=text_encoder,
             tokenizer=self.processor,
             prompt=prompt,
-            dtype=torch.bfloat16,
-            device=torch.device("cuda:0"),
+            dtype=torch_dtype(self.plan),
+            device=torch.device(self.primary_device),
             max_sequence_length=max_sequence_length,
-            hidden_states_layers=(10, 20, 30)
+            hidden_states_layers=(10, 20, 30),
         ).cpu()
 
     def load_pipeline(self):
-        transformer = Flux2Transformer2DModel.from_pretrained(
-            self.model_id,
-            subfolder="transformer",
-            torch_dtype=torch.bfloat16,
-            quantization_config=DiffusersBitsAndBytesConfig(
-                load_in_8bit=True,
-                llm_int8_threshold=6.0,
-                llm_int8_skip_modules=[
-                    "x_embedder",
-                    "context_embedder",
-                    "time_guidance_embed",
-                    "double_stream_modulation_img",
-                    "double_stream_modulation_txt",
-                    "single_stream_modulation",
-                    "norm_out",
-                    "proj_out",
-                ],
-            ),
-            device_map=self.transformer_device_map,
-            max_memory=self.max_memory
+        set_runtime_phase(self.plan, "transformer_loading")
+        current_quantization = DiffusersBitsAndBytesConfig(
+            load_in_8bit=True,
+            llm_int8_threshold=6.0,
+            llm_int8_skip_modules=[
+                "x_embedder",
+                "context_embedder",
+                "time_guidance_embed",
+                "double_stream_modulation_img",
+                "double_stream_modulation_txt",
+                "single_stream_modulation",
+                "norm_out",
+                "proj_out",
+            ],
         )
-
+        if is_exact_fast_path(self.plan):
+            transformer = Flux2Transformer2DModel.from_pretrained(
+                self.model_id,
+                subfolder="transformer",
+                torch_dtype=torch.bfloat16,
+                quantization_config=current_quantization,
+                device_map=self.transformer_device_map,
+                max_memory=self.max_memory,
+            )
+        elif is_cuda_plan(self.plan):
+            transformer = Flux2Transformer2DModel.from_pretrained(
+                self.model_id,
+                subfolder="transformer",
+                torch_dtype=torch_dtype(self.plan),
+                quantization_config=diffusers_quantization_config("transformer", self.plan),
+                device_map=self.transformer_device_map,
+                max_memory=self.max_memory,
+            )
+        else:
+            transformer = load_component(
+                Flux2Transformer2DModel,
+                self.model_id,
+                "transformer",
+                current_kwargs={"subfolder": "transformer", "torch_dtype": torch.bfloat16},
+                portable_base_kwargs={"subfolder": "transformer"},
+                shardable=True,
+                plan=self.plan,
+            )
         transformer.eval()
-
         return Flux2Pipeline(
             scheduler=self.scheduler,
             vae=self.vae,
             text_encoder=None,
             tokenizer=None,
-            transformer=transformer
+            transformer=transformer,
         )
 
     def decode_latents(self, pipe, packed_latents, height, width):
-        pipe.vae.to("cuda:1")
-        packed_latents = packed_latents.to("cuda:1")
-
+        pipe.vae.to(self.secondary_device)
+        packed_latents = packed_latents.to(self.secondary_device)
         latent_stub = torch.zeros(
             packed_latents.shape[0],
             128,
             height // 16,
             width // 16,
             device=packed_latents.device,
-            dtype=packed_latents.dtype
+            dtype=packed_latents.dtype,
         )
-
         latent_ids = Flux2Pipeline._prepare_latent_ids(latent_stub).to(packed_latents.device)
         latents = Flux2Pipeline._unpack_latents_with_ids(packed_latents, latent_ids)
         latents_bn_mean = pipe.vae.bn.running_mean.view(1, -1, 1, 1).to(latents.device, latents.dtype)
         latents_bn_std = torch.sqrt(pipe.vae.bn.running_var.view(1, -1, 1, 1) + pipe.vae.config.batch_norm_eps).to(latents.device, latents.dtype)
-
         latents = latents * latents_bn_std + latents_bn_mean
         latents = Flux2Pipeline._unpatchify_latents(latents)
-
         image = pipe.vae.decode(latents, return_dict=False)[0]
         return pipe.image_processor.postprocess(image, output_type="pil")
 
@@ -220,19 +275,21 @@ class Flux2Generator:
             text_encoder = self.text_encoder
             self.text_encoder = None
 
+        set_runtime_phase(self.plan, "text_encoding")
         prompt_embeds = self.encode_prompt(text_encoder, prompt, max_sequence_length)
 
         del text_encoder
         gc.collect()
-        torch.cuda.empty_cache()
+        clear_accelerator_cache()
 
         pipe = self.load_pipeline()
 
         if callback_on_step_end_tensor_inputs is None:
             callback_on_step_end_tensor_inputs = ["latents"]
 
+        set_runtime_phase(self.plan, "denoising")
         packed_latents = pipe(
-            prompt_embeds=prompt_embeds.to("cuda:0"),
+            prompt_embeds=prompt_embeds.to(self.primary_device),
             height=height,
             width=width,
             guidance_scale=guidance_scale,
@@ -247,12 +304,13 @@ class Flux2Generator:
         pipe.transformer = None
 
         gc.collect()
-        torch.cuda.empty_cache()
+        clear_accelerator_cache()
 
+        set_runtime_phase(self.plan, "vae_decode")
         images = self.decode_latents(pipe, packed_latents, height, width)
 
         self.vae.to("cpu")
-        torch.cuda.empty_cache()
+        clear_accelerator_cache()
 
         return images
 
@@ -287,46 +345,57 @@ class Flux2Generator:
 class GLMImagePipelineGPU1(GlmImagePipeline):
     @property
     def _execution_device(self):
-        return torch.device("cuda:1")
+        return torch.device(getattr(self, "planner_execution_device", "cuda:1"))
 
 class GLMImageGenerator:
-    def __init__(self):
+    def __init__(self, plan=None):
+        self.plan = plan or get_active_plan()
         self.model_id = "zai-org/GLM-Image"
-        self.max_memory = {0: "22GiB", 1: "22GiB"}
+        self.primary_device = execution_device(self.plan)
+        self.secondary_device = secondary_device(self.plan)
+        self.max_memory = {0: "22GiB", 1: "22GiB"} if is_exact_fast_path(self.plan) else plan_max_memory(self.plan)
+        secondary_index = 1 if self.secondary_device == "cuda:1" else 0
 
         processor = GlmImageProcessor.from_pretrained(self.model_id, subfolder="processor")
         tokenizer = ByT5Tokenizer.from_pretrained(self.model_id, subfolder="tokenizer")
         scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(self.model_id, subfolder="scheduler")
-
-        vision_language_encoder = GlmImageForConditionalGeneration.from_pretrained(
+        vision_language_encoder = load_component(
+            GlmImageForConditionalGeneration,
             self.model_id,
-            subfolder="vision_language_encoder",
-            torch_dtype=torch.bfloat16,
-            device_map={"": 0},
-            max_memory=self.max_memory
+            "vision_language_encoder",
+            current_kwargs={"subfolder": "vision_language_encoder", "torch_dtype": torch.bfloat16, "device_map": {"": 0}, "max_memory": self.max_memory},
+            portable_base_kwargs={"subfolder": "vision_language_encoder"},
+            shardable=True,
+            plan=self.plan,
+            portable_device_map={"": 0} if is_cuda_plan(self.plan) else None,
         )
-
-        text_encoder = T5EncoderModel.from_pretrained(
+        text_encoder = load_component(
+            T5EncoderModel,
             self.model_id,
-            subfolder="text_encoder",
-            torch_dtype=torch.bfloat16,
-            device_map={"": 1},
-            max_memory=self.max_memory
+            "text_encoder",
+            current_kwargs={"subfolder": "text_encoder", "torch_dtype": torch.bfloat16, "device_map": {"": 1}, "max_memory": self.max_memory},
+            portable_base_kwargs={"subfolder": "text_encoder"},
+            plan=self.plan,
+            portable_device_map={"": secondary_index} if is_cuda_plan(self.plan) else None,
         )
-
-        transformer = GlmImageTransformer2DModel.from_pretrained(
+        transformer = load_component(
+            GlmImageTransformer2DModel,
             self.model_id,
-            subfolder="transformer",
-            torch_dtype=torch.bfloat16,
-            device_map={"": 1},
-            max_memory=self.max_memory
+            "transformer",
+            current_kwargs={"subfolder": "transformer", "torch_dtype": torch.bfloat16, "device_map": {"": 1}, "max_memory": self.max_memory},
+            portable_base_kwargs={"subfolder": "transformer"},
+            shardable=True,
+            plan=self.plan,
+            portable_device_map={"": secondary_index} if is_cuda_plan(self.plan) else None,
         )
-
-        vae = AutoencoderKL.from_pretrained(
+        vae = load_component(
+            AutoencoderKL,
             self.model_id,
-            subfolder="vae",
-            torch_dtype=torch.bfloat16
-        ).to("cuda:1")
+            "vae",
+            current_kwargs={"subfolder": "vae", "torch_dtype": torch.bfloat16},
+            portable_base_kwargs={"subfolder": "vae"},
+            plan=self.plan,
+        ).to(self.secondary_device)
 
         vision_language_encoder.eval()
         text_encoder.eval()
@@ -334,32 +403,11 @@ class GLMImageGenerator:
         vae.eval()
         vae.enable_tiling()
         vae.enable_slicing()
-
-        vision_language_encoder_devices = self.validate_model_devices(
-            "vision-language encoder",
-            vision_language_encoder,
-            {"cuda:0"}
-        )
-        text_encoder_devices = self.validate_model_devices(
-            "text encoder",
-            text_encoder,
-            {"cuda:1"}
-        )
-        transformer_devices = self.validate_model_devices(
-            "transformer",
-            transformer,
-            {"cuda:1"}
-        )
-        vae_devices = self.validate_model_devices(
-            "VAE",
-            vae,
-            {"cuda:1"}
-        )
-
-        print("GLM Image vision-language encoder devices:", sorted(vision_language_encoder_devices))
-        print("GLM Image text encoder devices:", sorted(text_encoder_devices))
-        print("GLM Image transformer devices:", sorted(transformer_devices))
-        print("GLM Image VAE devices:", sorted(vae_devices))
+        if is_exact_fast_path(self.plan):
+            self.validate_model_devices("vision-language encoder", vision_language_encoder, {"cuda:0"})
+            self.validate_model_devices("text encoder", text_encoder, {"cuda:1"})
+            self.validate_model_devices("transformer", transformer, {"cuda:1"})
+            self.validate_model_devices("VAE", vae, {"cuda:1"})
 
         self.pipe = GLMImagePipelineGPU1(
             tokenizer=tokenizer,
@@ -368,8 +416,9 @@ class GLMImageGenerator:
             vision_language_encoder=vision_language_encoder,
             vae=vae,
             transformer=transformer,
-            scheduler=scheduler
+            scheduler=scheduler,
         )
+        self.pipe.planner_execution_device = self.secondary_device
 
     def validate_model_devices(self, name, model, expected_devices):
         parameter_devices = {
@@ -386,8 +435,8 @@ class GLMImageGenerator:
         return parameter_devices
 
     def encode_prompt(self, **kwargs):
-        kwargs["device"] = torch.device("cuda:1")
-        kwargs["dtype"] = torch.bfloat16
+        kwargs["device"] = torch.device(self.secondary_device)
+        kwargs["dtype"] = torch_dtype(self.plan)
         return self.pipe.encode_prompt(**kwargs)
 
     def close(self):
@@ -398,10 +447,7 @@ class GLMImageGenerator:
             self.pipe.vae = None
             self.pipe = None
 
-        gc.collect()
-        for device in range(torch.cuda.device_count()):
-            with torch.cuda.device(device):
-                torch.cuda.empty_cache()
+        clear_accelerator_cache()
 
     def __call__(self, **kwargs):
         if kwargs.get("prior_token_ids") is None:
@@ -424,110 +470,86 @@ class GLMImageGenerator:
                 image=normalized_image,
                 height=height,
                 width=width,
-                device=torch.device("cuda:0"),
+                device=torch.device(self.primary_device),
                 generator=ar_generator
             )
 
-            kwargs["prior_token_ids"] = prior_token_ids.to("cuda:1")
+            kwargs["prior_token_ids"] = prior_token_ids.to(self.secondary_device)
 
             if prior_token_image_ids is not None:
-                kwargs["prior_token_image_ids"] = [ids.to("cuda:1") for ids in prior_token_image_ids]
+                kwargs["prior_token_image_ids"] = [ids.to(self.secondary_device) for ids in prior_token_image_ids]
 
             if source_image_grid_thw is not None:
-                kwargs["source_image_grid_thw"] = [grid.to("cuda:1") for grid in source_image_grid_thw]
+                kwargs["source_image_grid_thw"] = [grid.to(self.secondary_device) for grid in source_image_grid_thw]
 
         return self.pipe(**kwargs)
 
 class QwenImageGenerator:
-    def __init__(self):
+    def __init__(self, plan=None):
+        self.plan = plan or get_active_plan()
         self.model_id = "Qwen/Qwen-Image"
-        self.max_memory = {0: "22GiB", 1: "22GiB"}
-
-        self.transformer_device_map = {
-            "pos_embed": 0,
-            "time_text_embed": 0,
-            "txt_norm": 0,
-            "img_in": 0,
-            "txt_in": 0,
-            "norm_out": 1,
-            "proj_out": 1,
-        }
-
-        self.transformer_device_map.update({f"transformer_blocks.{index}": 0 for index in range(16)})
-        self.transformer_device_map.update({f"transformer_blocks.{index}": 1 for index in range(16, 60)})
+        self.primary_device = execution_device(self.plan)
+        self.secondary_device = secondary_device(self.plan)
+        self.max_memory = {0: "22GiB", 1: "22GiB"} if is_exact_fast_path(self.plan) else plan_max_memory(self.plan)
+        if is_exact_fast_path(self.plan):
+            self.transformer_device_map = {
+                "pos_embed": 0, "time_text_embed": 0, "txt_norm": 0, "img_in": 0, "txt_in": 0,
+                "norm_out": 1, "proj_out": 1,
+            }
+            self.transformer_device_map.update({f"transformer_blocks.{index}": 0 for index in range(16)})
+            self.transformer_device_map.update({f"transformer_blocks.{index}": 1 for index in range(16, 60)})
+        else:
+            self.transformer_device_map = build_block_device_map(
+                "transformer_blocks", 60,
+                fixed_first=["pos_embed", "time_text_embed", "txt_norm", "img_in", "txt_in"],
+                fixed_last=["norm_out", "proj_out"], plan=self.plan,
+            )
 
         tokenizer = Qwen2Tokenizer.from_pretrained(self.model_id, subfolder="tokenizer")
         scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(self.model_id, subfolder="scheduler")
-
-        text_encoder = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            self.model_id,
-            subfolder="text_encoder",
-            torch_dtype=torch.bfloat16,
-            quantization_config=BitsAndBytesConfig(
-                load_in_8bit=True,
-                llm_int8_threshold=6.0,
-            ),
-            device_map={"": 0},
-            max_memory=self.max_memory
+        text_encoder = load_component(
+            Qwen2_5_VLForConditionalGeneration, self.model_id, "text_encoder",
+            current_kwargs={
+                "subfolder": "text_encoder", "torch_dtype": torch.bfloat16,
+                "quantization_config": BitsAndBytesConfig(load_in_8bit=True, llm_int8_threshold=6.0),
+                "device_map": {"": 0}, "max_memory": self.max_memory,
+            },
+            portable_base_kwargs={"subfolder": "text_encoder"}, plan=self.plan,
+            portable_device_map={"": 0} if is_cuda_plan(self.plan) else None,
         )
-
-        transformer = QwenImageTransformer2DModel.from_pretrained(
-            self.model_id,
-            subfolder="transformer",
-            torch_dtype=torch.bfloat16,
-            quantization_config=DiffusersBitsAndBytesConfig(
-                load_in_8bit=True,
-                llm_int8_threshold=6.0,
-                llm_int8_skip_modules=[
-                    "time_text_embed",
-                    "img_in",
-                    "txt_in",
-                    "norm_out",
-                    "proj_out",
-                ],
-            ),
-            device_map=self.transformer_device_map,
-            max_memory=self.max_memory
-        )
-
-        vae = AutoencoderKLQwenImage.from_pretrained(
-            self.model_id,
-            subfolder="vae",
-            torch_dtype=torch.bfloat16
-        ).to("cuda:0")
-
-        text_encoder.eval()
-        transformer.eval()
-        vae.eval()
-        vae.enable_tiling()
-        vae.enable_slicing()
-
-        text_encoder_devices = self.validate_model_devices(
-            "text encoder",
-            text_encoder,
-            {"cuda:0"}
-        )
-        transformer_devices = self.validate_model_devices(
-            "transformer",
-            transformer,
-            {"cuda:0", "cuda:1"}
-        )
-        vae_devices = self.validate_model_devices(
-            "VAE",
-            vae,
-            {"cuda:0"}
-        )
-
-        print("Qwen Image text encoder devices:", sorted(text_encoder_devices))
-        print("Qwen Image transformer devices:", sorted(transformer_devices))
-        print("Qwen Image VAE devices:", sorted(vae_devices))
-
+        if is_exact_fast_path(self.plan):
+            transformer = QwenImageTransformer2DModel.from_pretrained(
+                self.model_id, subfolder="transformer", torch_dtype=torch.bfloat16,
+                quantization_config=DiffusersBitsAndBytesConfig(
+                    load_in_8bit=True, llm_int8_threshold=6.0,
+                    llm_int8_skip_modules=["time_text_embed", "img_in", "txt_in", "norm_out", "proj_out"],
+                ),
+                device_map=self.transformer_device_map, max_memory=self.max_memory,
+            )
+        elif is_cuda_plan(self.plan):
+            transformer = QwenImageTransformer2DModel.from_pretrained(
+                self.model_id, subfolder="transformer", torch_dtype=torch_dtype(self.plan),
+                quantization_config=diffusers_quantization_config("transformer", self.plan),
+                device_map=self.transformer_device_map, max_memory=self.max_memory,
+            )
+        else:
+            transformer = load_component(
+                QwenImageTransformer2DModel, self.model_id, "transformer",
+                current_kwargs={"subfolder": "transformer", "torch_dtype": torch.bfloat16},
+                portable_base_kwargs={"subfolder": "transformer"}, shardable=True, plan=self.plan,
+            )
+        vae = load_component(
+            AutoencoderKLQwenImage, self.model_id, "vae",
+            current_kwargs={"subfolder": "vae", "torch_dtype": torch.bfloat16},
+            portable_base_kwargs={"subfolder": "vae"}, plan=self.plan,
+        ).to(self.primary_device)
+        text_encoder.eval(); transformer.eval(); vae.eval(); vae.enable_tiling(); vae.enable_slicing()
+        if is_exact_fast_path(self.plan):
+            self.validate_model_devices("text encoder", text_encoder, {"cuda:0"})
+            self.validate_model_devices("transformer", transformer, {"cuda:0", "cuda:1"})
+            self.validate_model_devices("VAE", vae, {"cuda:0"})
         self.pipe = QwenImagePipeline(
-            scheduler=scheduler,
-            vae=vae,
-            text_encoder=text_encoder,
-            tokenizer=tokenizer,
-            transformer=transformer
+            scheduler=scheduler, vae=vae, text_encoder=text_encoder, tokenizer=tokenizer, transformer=transformer,
         )
 
     def validate_model_devices(self, name, model, expected_devices):
@@ -551,10 +573,7 @@ class QwenImageGenerator:
             self.pipe.vae = None
             self.pipe = None
 
-        gc.collect()
-        for device in range(torch.cuda.device_count()):
-            with torch.cuda.device(device):
-                torch.cuda.empty_cache()
+        clear_accelerator_cache()
 
     def __call__(self, **kwargs):
         return self.pipe(**kwargs)
@@ -563,53 +582,44 @@ class QwenImageGenerator:
 class QwenImageEditPlusPipelineGPU0(QwenImageEditPlusPipeline):
     @property
     def _execution_device(self):
-        return torch.device("cuda:0")
+        return torch.device(getattr(self, "planner_execution_device", "cuda:0"))
 
 class QwenImageEditGenerator:
-    def __init__(self):
+    def __init__(self, plan=None):
+        self.plan = plan or get_active_plan()
         self.model_id = "ovedrive/Qwen-Image-Edit-2511-4bit"
-        self.max_memory = {0: "22GiB", 1: "22GiB"}
-
-        self.transformer_device_map = {
-            "pos_embed": 0,
-            "time_text_embed": 0,
-            "txt_norm": 0,
-            "img_in": 0,
-            "txt_in": 0,
-            "norm_out": 1,
-            "proj_out": 1,
-        }
-
-        self.transformer_device_map.update({f"transformer_blocks.{index}": 0 for index in range(30)})
-        self.transformer_device_map.update({f"transformer_blocks.{index}": 1 for index in range(30, 60)})
-
+        self.primary_device = execution_device(self.plan)
+        self.secondary_device = secondary_device(self.plan)
+        self.max_memory = {0: "22GiB", 1: "22GiB"} if is_exact_fast_path(self.plan) else plan_max_memory(self.plan)
+        if is_exact_fast_path(self.plan):
+            self.transformer_device_map = {
+                "pos_embed": 0, "time_text_embed": 0, "txt_norm": 0, "img_in": 0, "txt_in": 0,
+                "norm_out": 1, "proj_out": 1,
+            }
+            self.transformer_device_map.update({f"transformer_blocks.{index}": 0 for index in range(30)})
+            self.transformer_device_map.update({f"transformer_blocks.{index}": 1 for index in range(30, 60)})
+        else:
+            self.transformer_device_map = build_block_device_map(
+                "transformer_blocks", 60,
+                fixed_first=["pos_embed", "time_text_embed", "txt_norm", "img_in", "txt_in"],
+                fixed_last=["norm_out", "proj_out"], plan=self.plan,
+            )
         processor = Qwen2VLProcessor.from_pretrained(self.model_id, subfolder="processor")
         tokenizer = Qwen2Tokenizer.from_pretrained(self.model_id, subfolder="tokenizer")
         scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(self.model_id, subfolder="scheduler")
-        vae = AutoencoderKLQwenImage.from_pretrained(
-            self.model_id,
-            subfolder="vae",
-            torch_dtype=torch.bfloat16
-        ).to("cuda:0")
-
-        vae.eval()
-        vae.enable_tiling()
-        vae.enable_slicing()
-
+        vae = load_component(
+            AutoencoderKLQwenImage, self.model_id, "vae",
+            current_kwargs={"subfolder": "vae", "torch_dtype": torch.bfloat16},
+            portable_base_kwargs={"subfolder": "vae"}, plan=self.plan,
+        ).to(self.primary_device)
+        vae.eval(); vae.enable_tiling(); vae.enable_slicing()
         self.pipe = QwenImageEditPlusPipelineGPU0(
-            scheduler=scheduler,
-            vae=vae,
-            text_encoder=None,
-            tokenizer=tokenizer,
-            processor=processor,
-            transformer=None
+            scheduler=scheduler, vae=vae, text_encoder=None, tokenizer=tokenizer, processor=processor, transformer=None,
         )
+        self.pipe.planner_execution_device = self.primary_device
 
     def clear_cuda_cache(self):
-        gc.collect()
-        for device in range(torch.cuda.device_count()):
-            with torch.cuda.device(device):
-                torch.cuda.empty_cache()
+        clear_accelerator_cache()
 
     def validate_model_devices(self, name, model, expected_devices):
         parameter_devices = {
@@ -626,31 +636,37 @@ class QwenImageEditGenerator:
         return parameter_devices
 
     def load_text_encoder(self):
-        text_encoder = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            self.model_id,
-            subfolder="text_encoder",
-            torch_dtype=torch.bfloat16,
-            device_map={"": 0},
-            max_memory=self.max_memory
+        set_runtime_phase(self.plan, "text_encoder_loading")
+        text_encoder = load_component(
+            Qwen2_5_VLForConditionalGeneration, self.model_id, "text_encoder",
+            current_kwargs={
+                "subfolder": "text_encoder", "torch_dtype": torch.bfloat16,
+                "device_map": {"": 0}, "max_memory": self.max_memory,
+            },
+            portable_base_kwargs={"subfolder": "text_encoder"}, plan=self.plan,
+            portable_device_map={"": 0} if is_cuda_plan(self.plan) else None,
         )
-
         text_encoder.eval()
-        devices = self.validate_model_devices("text encoder", text_encoder, {"cuda:0"})
-        print("Qwen Image Edit text encoder devices:", sorted(devices))
+        if is_exact_fast_path(self.plan):
+            self.validate_model_devices("text encoder", text_encoder, {"cuda:0"})
         return text_encoder
 
     def load_transformer(self):
-        transformer = QwenImageTransformer2DModel.from_pretrained(
-            self.model_id,
-            subfolder="transformer",
-            torch_dtype=torch.bfloat16,
-            device_map=self.transformer_device_map,
-            max_memory=self.max_memory
-        )
-
+        set_runtime_phase(self.plan, "transformer_loading")
+        if is_cuda_plan(self.plan):
+            transformer = QwenImageTransformer2DModel.from_pretrained(
+                self.model_id, subfolder="transformer", torch_dtype=torch_dtype(self.plan),
+                device_map=self.transformer_device_map, max_memory=self.max_memory,
+            )
+        else:
+            transformer = load_component(
+                QwenImageTransformer2DModel, self.model_id, "transformer",
+                current_kwargs={"subfolder": "transformer", "torch_dtype": torch.bfloat16},
+                portable_base_kwargs={"subfolder": "transformer"}, shardable=True, plan=self.plan,
+            )
         transformer.eval()
-        devices = self.validate_model_devices("transformer", transformer, {"cuda:0", "cuda:1"})
-        print("Qwen Image Edit transformer devices:", sorted(devices))
+        if is_exact_fast_path(self.plan):
+            self.validate_model_devices("transformer", transformer, {"cuda:0", "cuda:1"})
         return transformer
 
     def prepare_condition_images(self, image):
@@ -675,7 +691,7 @@ class QwenImageEditGenerator:
             prompt_embeds, prompt_embeds_mask = self.pipe.encode_prompt(
                 image=condition_images,
                 prompt=prompt,
-                device=torch.device("cuda:0"),
+                device=torch.device(self.primary_device),
                 num_images_per_prompt=1,
                 max_sequence_length=max_sequence_length
             )
@@ -687,7 +703,7 @@ class QwenImageEditGenerator:
                 negative_prompt_embeds, negative_prompt_embeds_mask = self.pipe.encode_prompt(
                     image=condition_images,
                     prompt=negative_prompt,
-                    device=torch.device("cuda:0"),
+                    device=torch.device(self.primary_device),
                     num_images_per_prompt=1,
                     max_sequence_length=max_sequence_length
                 )
@@ -726,6 +742,7 @@ class QwenImageEditGenerator:
         callback_on_step_end=None,
         callback_on_step_end_tensor_inputs=None,
     ):
+        set_runtime_phase(self.plan, "text_encoding")
         (
             prompt_embeds,
             prompt_embeds_mask,
@@ -743,6 +760,7 @@ class QwenImageEditGenerator:
         self.pipe.transformer = transformer
 
         try:
+            set_runtime_phase(self.plan, "denoising")
             return self.pipe(
                 image=image,
                 prompt=None,
@@ -751,10 +769,10 @@ class QwenImageEditGenerator:
                 guidance_scale=guidance_scale,
                 num_inference_steps=num_inference_steps,
                 generator=generator,
-                prompt_embeds=prompt_embeds.to("cuda:0"),
-                prompt_embeds_mask=None if prompt_embeds_mask is None else prompt_embeds_mask.to("cuda:0"),
-                negative_prompt_embeds=None if negative_prompt_embeds is None else negative_prompt_embeds.to("cuda:0"),
-                negative_prompt_embeds_mask=None if negative_prompt_embeds_mask is None else negative_prompt_embeds_mask.to("cuda:0"),
+                prompt_embeds=prompt_embeds.to(self.primary_device),
+                prompt_embeds_mask=None if prompt_embeds_mask is None else prompt_embeds_mask.to(self.primary_device),
+                negative_prompt_embeds=None if negative_prompt_embeds is None else negative_prompt_embeds.to(self.primary_device),
+                negative_prompt_embeds_mask=None if negative_prompt_embeds_mask is None else negative_prompt_embeds_mask.to(self.primary_device),
                 callback_on_step_end=callback_on_step_end,
                 callback_on_step_end_tensor_inputs=callback_on_step_end_tensor_inputs or ["latents"],
                 max_sequence_length=max_sequence_length
@@ -768,113 +786,77 @@ class QwenImageEditGenerator:
 class ChronoEditPipelineGPU0(ChronoEditPipeline):
     @property
     def _execution_device(self):
-        return torch.device("cuda:0")
+        return torch.device(getattr(self, "planner_execution_device", "cuda:0"))
 
 class ChronoEditGenerator:
-    def __init__(self):
+    def __init__(self, plan=None):
+        self.plan = plan or get_active_plan()
         self.model_id = "nvidia/ChronoEdit-14B-Diffusers"
-        self.max_memory = {0: "22GiB", 1: "22GiB"}
-
-        self.transformer_device_map = {
-            "rope": 0,
-            "patch_embedding": 0,
-            "condition_embedder": 0,
-            "scale_shift_table": 0,
-            "norm_out": 1,
-            "proj_out": 1,
-        }
-
-        self.transformer_device_map.update({f"blocks.{index}": 0 for index in range(10)})
-        self.transformer_device_map.update({f"blocks.{index}": 1 for index in range(10, 40)})
-
+        self.primary_device = execution_device(self.plan)
+        self.secondary_device = secondary_device(self.plan)
+        self.max_memory = {0: "22GiB", 1: "22GiB"} if is_exact_fast_path(self.plan) else plan_max_memory(self.plan)
+        if is_exact_fast_path(self.plan):
+            self.transformer_device_map = {"rope": 0, "patch_embedding": 0, "condition_embedder": 0, "scale_shift_table": 0, "norm_out": 1, "proj_out": 1}
+            self.transformer_device_map.update({f"blocks.{index}": 0 for index in range(10)})
+            self.transformer_device_map.update({f"blocks.{index}": 1 for index in range(10, 40)})
+        else:
+            self.transformer_device_map = build_block_device_map(
+                "blocks", 40,
+                fixed_first=["rope", "patch_embedding", "condition_embedder", "scale_shift_table"],
+                fixed_last=["norm_out", "proj_out"], plan=self.plan,
+            )
         tokenizer = AutoTokenizer.from_pretrained(self.model_id, subfolder="tokenizer")
         image_processor = CLIPProcessor.from_pretrained(self.model_id, subfolder="image_processor")
         scheduler = UniPCMultistepScheduler.from_pretrained(self.model_id, subfolder="scheduler")
-
-        text_encoder = UMT5EncoderModel.from_pretrained(
-            self.model_id,
-            subfolder="text_encoder",
-            torch_dtype=torch.bfloat16,
-            quantization_config=BitsAndBytesConfig(
-                load_in_8bit=True,
-                llm_int8_threshold=6.0,
-            ),
-            device_map={"": 0},
-            max_memory=self.max_memory
+        text_encoder = load_component(
+            UMT5EncoderModel, self.model_id, "text_encoder",
+            current_kwargs={
+                "subfolder": "text_encoder", "torch_dtype": torch.bfloat16,
+                "quantization_config": BitsAndBytesConfig(load_in_8bit=True, llm_int8_threshold=6.0),
+                "device_map": {"": 0}, "max_memory": self.max_memory,
+            },
+            portable_base_kwargs={"subfolder": "text_encoder"}, plan=self.plan,
+            portable_device_map={"": 0} if is_cuda_plan(self.plan) else None,
         )
-
-        image_encoder = CLIPVisionModel.from_pretrained(
-            self.model_id,
-            subfolder="image_encoder",
-            torch_dtype=torch.float32
-        ).to("cuda:0")
-
-        transformer = ChronoEditTransformer3DModel.from_pretrained(
-            self.model_id,
-            subfolder="transformer",
-            torch_dtype=torch.bfloat16,
-            quantization_config=DiffusersBitsAndBytesConfig(
-                load_in_8bit=True,
-                llm_int8_threshold=6.0,
-                llm_int8_skip_modules=[
-                    "patch_embedding",
-                    "condition_embedder",
-                    "norm_out",
-                    "proj_out",
-                ],
-            ),
-            device_map=self.transformer_device_map,
-            max_memory=self.max_memory
+        image_encoder = load_component(
+            CLIPVisionModel, self.model_id, "image_encoder",
+            current_kwargs={"subfolder": "image_encoder", "torch_dtype": torch.float32},
+            portable_base_kwargs={"subfolder": "image_encoder"}, plan=self.plan,
+            portable_device_map={"": 0} if is_cuda_plan(self.plan) else None,
         )
-
-        vae = AutoencoderKLWan.from_pretrained(
-            self.model_id,
-            subfolder="vae",
-            torch_dtype=torch.float32
-        ).to("cuda:0")
-
-        text_encoder.eval()
-        image_encoder.eval()
-        transformer.eval()
-        vae.eval()
-        vae.enable_tiling()
-        vae.enable_slicing()
-
-        text_encoder_devices = self.validate_model_devices(
-            "text encoder",
-            text_encoder,
-            {"cuda:0"}
-        )
-        image_encoder_devices = self.validate_model_devices(
-            "image encoder",
-            image_encoder,
-            {"cuda:0"}
-        )
-        transformer_devices = self.validate_model_devices(
-            "transformer",
-            transformer,
-            {"cuda:0", "cuda:1"}
-        )
-        vae_devices = self.validate_model_devices(
-            "VAE",
-            vae,
-            {"cuda:0"}
-        )
-
-        print("ChronoEdit text encoder devices:", sorted(text_encoder_devices))
-        print("ChronoEdit image encoder devices:", sorted(image_encoder_devices))
-        print("ChronoEdit transformer devices:", sorted(transformer_devices))
-        print("ChronoEdit VAE devices:", sorted(vae_devices))
-
+        if is_cuda_plan(self.plan):
+            transformer = ChronoEditTransformer3DModel.from_pretrained(
+                self.model_id, subfolder="transformer", torch_dtype=torch_dtype(self.plan),
+                quantization_config=(
+                    DiffusersBitsAndBytesConfig(
+                        load_in_8bit=True, llm_int8_threshold=6.0,
+                        llm_int8_skip_modules=["patch_embedding", "condition_embedder", "norm_out", "proj_out"],
+                    ) if is_exact_fast_path(self.plan) else diffusers_quantization_config("transformer", self.plan)
+                ),
+                device_map=self.transformer_device_map, max_memory=self.max_memory,
+            )
+        else:
+            transformer = load_component(
+                ChronoEditTransformer3DModel, self.model_id, "transformer",
+                current_kwargs={"subfolder": "transformer", "torch_dtype": torch.bfloat16},
+                portable_base_kwargs={"subfolder": "transformer"}, shardable=True, plan=self.plan,
+            )
+        vae = load_component(
+            AutoencoderKLWan, self.model_id, "vae",
+            current_kwargs={"subfolder": "vae", "torch_dtype": torch.float32},
+            portable_base_kwargs={"subfolder": "vae"}, plan=self.plan,
+        ).to(self.primary_device)
+        text_encoder.eval(); image_encoder.eval(); transformer.eval(); vae.eval(); vae.enable_tiling(); vae.enable_slicing()
+        if is_exact_fast_path(self.plan):
+            self.validate_model_devices("text encoder", text_encoder, {"cuda:0"})
+            self.validate_model_devices("image encoder", image_encoder, {"cuda:0"})
+            self.validate_model_devices("transformer", transformer, {"cuda:0", "cuda:1"})
+            self.validate_model_devices("VAE", vae, {"cuda:0"})
         self.pipe = ChronoEditPipelineGPU0(
-            tokenizer=tokenizer,
-            text_encoder=text_encoder,
-            image_encoder=image_encoder,
-            image_processor=image_processor,
-            transformer=transformer,
-            vae=vae,
-            scheduler=scheduler
+            tokenizer=tokenizer, text_encoder=text_encoder, image_encoder=image_encoder,
+            image_processor=image_processor, transformer=transformer, vae=vae, scheduler=scheduler,
         )
+        self.pipe.planner_execution_device = self.primary_device
 
     def validate_model_devices(self, name, model, expected_devices):
         parameter_devices = {
@@ -898,10 +880,7 @@ class ChronoEditGenerator:
             self.pipe.vae = None
             self.pipe = None
 
-        gc.collect()
-        for device in range(torch.cuda.device_count()):
-            with torch.cuda.device(device):
-                torch.cuda.empty_cache()
+        clear_accelerator_cache()
 
     def __call__(self, **kwargs):
         kwargs.pop("strength", None)
@@ -926,109 +905,88 @@ class ChronoEditGenerator:
         return SimpleNamespace(images=images)
 
 class Kandinsky5I2VGenerator:
-    def __init__(self):
+    def __init__(self, plan=None):
+        self.plan = plan or get_active_plan()
         self.model_id = "kandinskylab/Kandinsky-5.0-I2V-Pro-sft-5s-Diffusers"
-        self.max_memory = {0: "22GiB", 1: "22GiB", "cpu": "48GiB"}
-
-        self.transformer_device_map = {
-            "time_embeddings": 0,
-            "text_embeddings": 0,
-            "pooled_text_embeddings": 0,
-            "visual_embeddings": 0,
-            "text_rope_embeddings": 0,
-            "visual_rope_embeddings": 0,
-            "text_transformer_blocks": 0,
-            "out_layer": 1,
-        }
-
-        self.transformer_device_map.update({f"visual_transformer_blocks.{index}": 0 for index in range(29)})
-        self.transformer_device_map.update({f"visual_transformer_blocks.{index}": 1 for index in range(29, 60)})
-
-        self.transformer_skip_modules = [
-            "time_embeddings",
-            "text_embeddings",
-            "pooled_text_embeddings",
-            "visual_embeddings",
-            "out_layer",
-        ]
-
+        self.primary_device = execution_device(self.plan)
+        self.secondary_device = secondary_device(self.plan)
+        self.max_memory = {0: "22GiB", 1: "22GiB", "cpu": "48GiB"} if is_exact_fast_path(self.plan) else plan_max_memory(self.plan)
+        if is_exact_fast_path(self.plan):
+            self.transformer_device_map = {
+                "time_embeddings": 0, "text_embeddings": 0, "pooled_text_embeddings": 0,
+                "visual_embeddings": 0, "text_rope_embeddings": 0, "visual_rope_embeddings": 0,
+                "text_transformer_blocks": 0, "out_layer": 1,
+            }
+            self.transformer_device_map.update({f"visual_transformer_blocks.{index}": 0 for index in range(29)})
+            self.transformer_device_map.update({f"visual_transformer_blocks.{index}": 1 for index in range(29, 60)})
+        else:
+            self.transformer_device_map = build_block_device_map(
+                "visual_transformer_blocks", 60,
+                fixed_first=["time_embeddings", "text_embeddings", "pooled_text_embeddings", "visual_embeddings", "text_rope_embeddings", "visual_rope_embeddings", "text_transformer_blocks"],
+                fixed_last=["out_layer"], plan=self.plan,
+            )
+        self.transformer_skip_modules = ["time_embeddings", "text_embeddings", "pooled_text_embeddings", "visual_embeddings", "out_layer"]
         self.transformer_skip_modules.extend([f"text_transformer_blocks.{index}.text_modulation" for index in range(4)])
         self.transformer_skip_modules.extend([f"visual_transformer_blocks.{index}.visual_modulation" for index in range(60)])
-
         self.processor = Qwen2VLProcessor.from_pretrained(self.model_id, subfolder="tokenizer")
         self.tokenizer_2 = CLIPTokenizer.from_pretrained(self.model_id, subfolder="tokenizer_2")
         self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(self.model_id, subfolder="scheduler")
-        self.vae = AutoencoderKLHunyuanVideo.from_pretrained(
-            self.model_id,
-            subfolder="vae",
-            torch_dtype=torch.bfloat16
+        self.vae = load_component(
+            AutoencoderKLHunyuanVideo, self.model_id, "vae",
+            current_kwargs={"subfolder": "vae", "torch_dtype": torch.bfloat16},
+            portable_base_kwargs={"subfolder": "vae"}, plan=self.plan,
+            portable_device_map={"": "cpu"},
         )
-
-        self.vae.eval()
-        self.vae.enable_tiling()
-        self.vae.enable_slicing()
-
-        flex_attention.flex_attention = torch.compile(
-            flex_attention.flex_attention,
-            mode="max-autotune-no-cudagraphs",
-            dynamic=True
-        )
-
+        self.vae.eval(); self.vae.enable_tiling(); self.vae.enable_slicing()
+        if is_cuda_plan(self.plan):
+            flex_attention.flex_attention = torch.compile(
+                flex_attention.flex_attention, mode="max-autotune-no-cudagraphs", dynamic=True,
+            )
         self.pipe = None
         self._interrupt = False
 
     def clear_cuda_cache(self):
-        gc.collect()
-        for device in range(torch.cuda.device_count()):
-            with torch.cuda.device(device):
-                torch.cuda.empty_cache()
+        clear_accelerator_cache()
 
     def load_text_pipeline(self):
-        text_encoder = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            self.model_id,
-            subfolder="text_encoder",
-            torch_dtype=torch.bfloat16,
-            quantization_config=BitsAndBytesConfig(
-                load_in_8bit=True,
-                llm_int8_threshold=6.0,
-                llm_int8_skip_modules=["visual", "lm_head"],
-            ),
-            device_map="balanced",
-            max_memory=self.max_memory
+        set_runtime_phase(self.plan, "text_encoder_loading")
+        text_encoder = load_component(
+            Qwen2_5_VLForConditionalGeneration, self.model_id, "qwen_text_encoder",
+            current_kwargs={
+                "subfolder": "text_encoder", "torch_dtype": torch.bfloat16,
+                "quantization_config": BitsAndBytesConfig(
+                    load_in_8bit=True, llm_int8_threshold=6.0,
+                    llm_int8_skip_modules=["visual", "lm_head"],
+                ),
+                "device_map": "balanced", "max_memory": self.max_memory,
+            },
+            portable_base_kwargs={"subfolder": "text_encoder"}, shardable=True, plan=self.plan,
         )
-
-        text_encoder_2 = CLIPTextModel.from_pretrained(
-            self.model_id,
-            subfolder="text_encoder_2",
-            torch_dtype=torch.bfloat16
-        ).to("cuda:0")
-
-        text_encoder.eval()
-        text_encoder_2.eval()
-
+        text_encoder_2 = load_component(
+            CLIPTextModel, self.model_id, "clip_text_encoder",
+            current_kwargs={"subfolder": "text_encoder_2", "torch_dtype": torch.bfloat16},
+            portable_base_kwargs={"subfolder": "text_encoder_2"}, plan=self.plan,
+            portable_device_map={"": 0} if is_cuda_plan(self.plan) else None,
+        )
+        text_encoder.eval(); text_encoder_2.eval()
         self.pipe = Kandinsky5I2VPipeline(
-            scheduler=self.scheduler,
-            vae=self.vae,
-            text_encoder=text_encoder,
-            tokenizer=self.processor,
-            text_encoder_2=text_encoder_2,
-            tokenizer_2=self.tokenizer_2,
-            transformer=None
+            scheduler=self.scheduler, vae=self.vae, text_encoder=text_encoder, tokenizer=self.processor,
+            text_encoder_2=text_encoder_2, tokenizer_2=self.tokenizer_2, transformer=None,
         )
 
     def encode_prompts(self, prompt, negative_prompt, max_sequence_length):
         prompt_embeds_qwen, prompt_embeds_clip, prompt_cu_seqlens = self.pipe.encode_prompt(
             prompt=prompt,
             max_sequence_length=max_sequence_length,
-            device=torch.device("cuda:0"),
-            dtype=torch.bfloat16
+            device=torch.device(self.primary_device),
+            dtype=torch_dtype(self.plan)
         )
 
         negative_prompt_embeds_qwen, negative_prompt_embeds_clip, negative_prompt_cu_seqlens = self.pipe.encode_prompt(
             prompt=negative_prompt,
             max_sequence_length=max_sequence_length,
-            device=torch.device("cuda:0"),
-            dtype=torch.bfloat16
+            device=torch.device(self.primary_device),
+            dtype=torch_dtype(self.plan)
         )
 
         return (
@@ -1041,7 +999,8 @@ class Kandinsky5I2VGenerator:
         )
 
     def prepare_latents(self, image, height, width, num_frames, seed):
-        device = torch.device("cuda:1")
+        set_runtime_phase(self.plan, "vae_source_encode")
+        device = torch.device(self.secondary_device)
         generator = torch.Generator(device=device).manual_seed(seed)
         num_latent_frames = (num_frames - 1) // self.vae.config.temporal_compression_ratio + 1
 
@@ -1053,14 +1012,14 @@ class Kandinsky5I2VGenerator:
             16,
             generator=generator,
             device=device,
-            dtype=torch.bfloat16
+            dtype=torch_dtype(self.plan)
         )
 
         self.vae.to(device)
 
         image_tensor = self.pipe.video_processor.preprocess(image, height=height, width=width).to(
             device,
-            dtype=torch.bfloat16
+            dtype=torch_dtype(self.plan)
         )
 
         image_latents = self.vae.encode(image_tensor.unsqueeze(2)).latent_dist.sample(generator=generator)
@@ -1077,7 +1036,7 @@ class Kandinsky5I2VGenerator:
             width // self.vae.config.spatial_compression_ratio,
             1,
             device=device,
-            dtype=torch.bfloat16
+            dtype=torch_dtype(self.plan)
         )
 
         visual_cond_mask[:, 0:1] = 1
@@ -1095,34 +1054,39 @@ class Kandinsky5I2VGenerator:
         self.clear_cuda_cache()
 
     def load_transformer(self):
-        transformer = Kandinsky5Transformer3DModel.from_pretrained(
-            self.model_id,
-            subfolder="transformer",
-            torch_dtype=torch.bfloat16,
-            quantization_config=DiffusersBitsAndBytesConfig(
-                load_in_8bit=True,
-                llm_int8_threshold=6.0,
-                llm_int8_skip_modules=self.transformer_skip_modules,
-            ),
-            device_map=self.transformer_device_map,
-            max_memory=self.max_memory
-        )
-
+        set_runtime_phase(self.plan, "transformer_loading")
+        if is_cuda_plan(self.plan):
+            transformer = Kandinsky5Transformer3DModel.from_pretrained(
+                self.model_id, subfolder="transformer", torch_dtype=torch_dtype(self.plan),
+                quantization_config=(
+                    DiffusersBitsAndBytesConfig(
+                        load_in_8bit=True, llm_int8_threshold=6.0,
+                        llm_int8_skip_modules=self.transformer_skip_modules,
+                    ) if is_exact_fast_path(self.plan) else diffusers_quantization_config("transformer", self.plan, self.transformer_skip_modules)
+                ),
+                device_map=self.transformer_device_map, max_memory=self.max_memory,
+            )
+        else:
+            transformer = load_component(
+                Kandinsky5Transformer3DModel, self.model_id, "transformer",
+                current_kwargs={"subfolder": "transformer", "torch_dtype": torch.bfloat16},
+                portable_base_kwargs={"subfolder": "transformer"}, shardable=True, plan=self.plan,
+            )
         transformer.eval()
-        transformer.set_attention_backend("flex")
+        if is_cuda_plan(self.plan):
+            transformer.set_attention_backend("flex")
         return transformer
 
     def decode_latents(self, latent_video):
-        self.vae.to("cuda:1")
-        video = latent_video.to("cuda:1", dtype=self.vae.dtype)
+        set_runtime_phase(self.plan, "vae_decode")
+        self.vae.to(self.secondary_device)
+        video = latent_video.to(self.secondary_device, dtype=self.vae.dtype)
         video = video.permute(0, 4, 1, 2, 3)
         video = video / self.vae.config.scaling_factor
         video = self.vae.decode(video).sample
         video_frames = self.pipe.video_processor.postprocess_video(video, output_type="pil")[0]
-
         self.vae.to("cpu")
         self.clear_cuda_cache()
-
         return video_frames
 
     def close(self):
@@ -1173,6 +1137,7 @@ class Kandinsky5I2VGenerator:
         transformer = self.load_transformer()
         self.pipe.transformer = transformer
 
+        set_runtime_phase(self.plan, "denoising")
         latent_video = self.pipe(
             image=image,
             prompt=None,

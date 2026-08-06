@@ -237,6 +237,13 @@ PLAN_TEMPLATES = {
         'quality_class': 'reduced',
         'minimum_gpu_count': 1
     },
+    'staged_int4_multi': {
+        'placement': 'multi_gpu_model_specific_staging',
+        'quantization_mode': 'int4',
+        'speed_class': 'good',
+        'quality_class': 'reduced',
+        'minimum_gpu_count': 2
+    },
     'model_cpu_offload_native': {
         'placement': 'diffusers_model_cpu_offload',
         'quantization_mode': 'native',
@@ -250,6 +257,14 @@ PLAN_TEMPLATES = {
         'quantization_mode': 'int8',
         'speed_class': 'usable',
         'quality_class': 'near_native',
+        'minimum_gpu_count': 1,
+        'allows_cpu_overflow': True
+    },
+    'model_cpu_offload_int4': {
+        'placement': 'diffusers_model_cpu_offload',
+        'quantization_mode': 'int4',
+        'speed_class': 'slow',
+        'quality_class': 'reduced',
         'minimum_gpu_count': 1,
         'allows_cpu_overflow': True
     },
@@ -5743,7 +5758,7 @@ RAW_MODEL_PROFILES = [
         'backend_support': {
             'cuda': 'supported_by_current_loader',
             'mps': 'not_supported_by_current_realesrganer_path',
-            'cpu': 'implementation_change_required',
+            'cpu': 'supported_and_practical_for_moderate_images',
             'bitsandbytes_cuda': False,
             'comfyui': False
         },
@@ -8575,7 +8590,7 @@ def support_allows(value, precision):
     blocked = ['disabled', 'avoid', 'not_recommended', 'unnecessary', 'not_officially_recommended']
     if any(word in text for word in blocked):
         return False
-    if precision == 'int4' and 'last_resort' in text:
+    if precision == 'int4' and any(word in text for word in ['last_resort', 'high_caution', 'official', 'available']):
         return True
     return any(word in text for word in ['supported', 'recommended', 'current', 'native', 'acceptable', 'optional', 'fallback', 'artifact'])
 
@@ -8706,14 +8721,14 @@ def plan_system_ram(profile, precision_map, placement):
     return round_gib(minimum), round_gib(recommended)
 
 
-def make_candidate_plan(profile, template_id, precision_mode, plan_id=None, notes=None):
+def make_candidate_plan(profile, template_id, precision_mode, plan_id=None, notes=None, precision_map=None):
     template = deepcopy(PLAN_TEMPLATES[template_id])
-    precision_map = component_precision_map(profile, precision_mode)
+    precision_map = deepcopy(precision_map) if precision_map is not None else component_precision_map(profile, precision_mode)
     placement = template['placement']
-    summary = profile['memory_summary'][precision_mode if precision_mode in profile['memory_summary'] else 'native']
+    phase_memory = calculate_phase_memory(profile, precision_map)
     resident_weight = component_map_weight_gib(profile, precision_map)
     largest_component = largest_component_weight_gib(profile, precision_map)
-    phase_peak = summary['largest_estimated_phase_peak_gib']
+    phase_peak = round_gib(max([value['estimated_peak_gib'] for value in phase_memory.values()] or [0.0]))
     runtime_headroom = float(profile.get('runtime_memory', {}).get('default_runtime_headroom_gib', 2.0))
 
     if placement == 'single_gpu_resident':
@@ -8797,6 +8812,17 @@ def existing_fast_path_plan(profile):
     return plan
 
 
+def append_llm_resident_plans(plans, profile, precision):
+    plans.append(make_candidate_plan(profile, f'resident_{precision}_single', precision))
+    if profile.get('placement_support', {}).get('multi_gpu_device_map'):
+        plans.append(make_candidate_plan(profile, f'resident_{precision}_multi', precision))
+
+
+def append_llm_cpu_overflow_plan(plans, profile, precision):
+    if profile.get('placement_support', {}).get('cpu_overflow_device_map'):
+        plans.append(make_candidate_plan(profile, f'{precision}_cpu_overflow', precision))
+
+
 def build_llm_plans(profile):
     plans = []
     fast_path = existing_fast_path_plan(profile)
@@ -8805,39 +8831,81 @@ def build_llm_plans(profile):
 
     checkpoint_format = profile.get('checkpoint', {}).get('format')
     current_loader = profile.get('current_code', {}).get('loader')
-    int4_allowed = profile.get('quantization_policy', {}).get('int4_auto_allowed', False)
+    quantization_policy = profile.get('quantization_policy', {})
+    int4_allowed = quantization_policy.get('int4_auto_allowed', False)
+    int4_priority = quantization_policy.get('int4_priority', '')
+    int4_before_cpu_overflow = int4_priority in [
+        'after_int8_resident_and_before_sequential_offload',
+        'application_current_default_due_large_multimodal_checkpoint',
+    ]
 
     if current_loader == 'vllm_async_engine':
         plans.append(make_candidate_plan(profile, 'vllm_native', 'native', f"{profile['key']}__vllm_native"))
 
-    plans.append(make_candidate_plan(profile, 'resident_native_single', 'native'))
-    if profile.get('placement_support', {}).get('multi_gpu_device_map'):
-        plans.append(make_candidate_plan(profile, 'resident_native_multi', 'native'))
+    append_llm_resident_plans(plans, profile, 'native')
 
     if checkpoint_format == 'safetensors':
-        plans.append(make_candidate_plan(profile, 'resident_int8_single', 'int8'))
-        if profile.get('placement_support', {}).get('multi_gpu_device_map'):
-            plans.append(make_candidate_plan(profile, 'resident_int8_multi', 'int8'))
-        if profile.get('placement_support', {}).get('cpu_overflow_device_map'):
-            plans.append(make_candidate_plan(profile, 'int8_cpu_overflow', 'int8'))
+        append_llm_resident_plans(plans, profile, 'int8')
+
+        if int4_allowed and int4_before_cpu_overflow:
+            append_llm_resident_plans(plans, profile, 'int4')
+
+        append_llm_cpu_overflow_plan(plans, profile, 'int8')
+
+        if int4_allowed and not int4_before_cpu_overflow:
+            append_llm_resident_plans(plans, profile, 'int4')
+
         if int4_allowed:
-            plans.append(make_candidate_plan(profile, 'resident_int4_single', 'int4'))
-            if profile.get('placement_support', {}).get('multi_gpu_device_map'):
-                plans.append(make_candidate_plan(profile, 'resident_int4_multi', 'int4'))
-            if profile.get('placement_support', {}).get('cpu_overflow_device_map'):
-                plans.append(make_candidate_plan(profile, 'int4_cpu_overflow', 'int4'))
+            append_llm_cpu_overflow_plan(plans, profile, 'int4')
 
     if profile.get('backend_support', {}).get('mps', '').startswith('supported'):
         plans.append(make_candidate_plan(profile, 'mps_native', 'native'))
 
     cpu_practicality = profile.get('backend_support', {}).get('cpu_practicality')
     if cpu_practicality in ['practical', 'usable', 'emergency']:
+        plans.append(make_candidate_plan(profile, 'cpu_native', 'native'))
         if checkpoint_format == 'safetensors' and float(profile['architecture'].get('parameter_billions', 0.0)) >= 7.0:
             plans.append(make_candidate_plan(profile, 'cpu_int8', 'int8'))
-        else:
-            plans.append(make_candidate_plan(profile, 'cpu_native', 'native'))
 
     return plans
+
+
+def progressive_int4_precision_maps(profile):
+    target_order = profile.get('quantization_policy', {}).get('int4_target_order', [])
+    if not target_order:
+        return [component_precision_map(profile, 'int4')]
+
+    base_map = component_precision_map(profile, 'int8')
+    result = []
+    for target_count in range(1, len(target_order) + 1):
+        precision_map = deepcopy(base_map)
+        for component_name in target_order[:target_count]:
+            component = profile.get('components', {}).get(component_name)
+            if component and support_allows(component.get('quantization_support', {}).get('int4'), 'int4'):
+                precision_map[component_name] = 'int4'
+        if precision_map not in result:
+            result.append(precision_map)
+
+    return result or [component_precision_map(profile, 'int4')]
+
+
+def append_progressive_int4_plans(plans, profile, template_id):
+    precision_maps = progressive_int4_precision_maps(profile)
+    for index, precision_map in enumerate(precision_maps, start=1):
+        plan_id = f"{profile['key']}__{template_id}__step_{index}"
+        targets = [
+            name
+            for name, precision in precision_map.items()
+            if precision == 'int4'
+        ]
+        plans.append(make_candidate_plan(
+            profile,
+            template_id,
+            'int4',
+            plan_id=plan_id,
+            notes=[f"Progressive INT4 targets: {', '.join(targets)}"],
+            precision_map=precision_map,
+        ))
 
 
 def build_diffusion_plans(profile):
@@ -8847,30 +8915,33 @@ def build_diffusion_plans(profile):
         plans.append(fast_path)
 
     placement = profile.get('placement_support', {})
-    checkpoint_format = profile.get('checkpoint', {}).get('format')
-    int8_allowed = profile.get('quantization_policy', {}).get('int8_auto_allowed', True)
-    int4_allowed = profile.get('quantization_policy', {}).get('int4_auto_allowed', False)
+    checkpoint = profile.get('checkpoint', {})
+    checkpoint_format = checkpoint.get('format')
+    already_quantized = checkpoint.get('already_quantized', False)
+    int8_allowed = profile.get('quantization_policy', {}).get('int8_auto_allowed', True) and not already_quantized
+    int4_allowed = profile.get('quantization_policy', {}).get('int4_auto_allowed', False) and not already_quantized
+    multi_gpu = placement.get('multi_gpu_component_placement') or placement.get('multi_gpu_block_sharding')
 
     if checkpoint_format == 'comfy_checkpoint_native':
         plans.append(make_candidate_plan(profile, 'comfy_native', 'native'))
         return plans
 
     plans.append(make_candidate_plan(profile, 'resident_native_single', 'native'))
-    if placement.get('multi_gpu_component_placement') or placement.get('multi_gpu_block_sharding'):
+    if multi_gpu:
         plans.append(make_candidate_plan(profile, 'resident_native_multi', 'native'))
 
     if int8_allowed:
         plans.append(make_candidate_plan(profile, 'resident_int8_single', 'int8'))
-        if placement.get('multi_gpu_component_placement') or placement.get('multi_gpu_block_sharding'):
+        if multi_gpu:
             plans.append(make_candidate_plan(profile, 'resident_int8_multi', 'int8'))
 
     if placement.get('custom_staging'):
         plans.append(make_candidate_plan(profile, 'staged_native_single', 'native'))
-        if placement.get('multi_gpu_component_placement') or placement.get('multi_gpu_block_sharding'):
+        if multi_gpu:
             plans.append(make_candidate_plan(profile, 'staged_native_multi', 'native'))
         if int8_allowed:
             plans.append(make_candidate_plan(profile, 'staged_int8_single', 'int8'))
-            if placement.get('multi_gpu_component_placement') or placement.get('multi_gpu_block_sharding'):
+            if multi_gpu:
                 plans.append(make_candidate_plan(profile, 'staged_int8_multi', 'int8'))
 
     if placement.get('model_cpu_offload'):
@@ -8878,12 +8949,23 @@ def build_diffusion_plans(profile):
         if int8_allowed:
             plans.append(make_candidate_plan(profile, 'model_cpu_offload_int8', 'int8'))
 
+    if placement.get('device_map'):
+        plans.append(make_candidate_plan(profile, 'balanced_native_cpu_overflow', 'native'))
+        if int8_allowed:
+            plans.append(make_candidate_plan(profile, 'int8_cpu_overflow', 'int8'))
+
     if int4_allowed:
-        plans.append(make_candidate_plan(profile, 'resident_int4_single', 'int4'))
-        if placement.get('multi_gpu_component_placement') or placement.get('multi_gpu_block_sharding'):
-            plans.append(make_candidate_plan(profile, 'resident_int4_multi', 'int4'))
+        append_progressive_int4_plans(plans, profile, 'resident_int4_single')
+        if multi_gpu:
+            append_progressive_int4_plans(plans, profile, 'resident_int4_multi')
         if placement.get('custom_staging'):
-            plans.append(make_candidate_plan(profile, 'staged_int4_single', 'int4'))
+            append_progressive_int4_plans(plans, profile, 'staged_int4_single')
+            if multi_gpu:
+                append_progressive_int4_plans(plans, profile, 'staged_int4_multi')
+        if placement.get('model_cpu_offload'):
+            append_progressive_int4_plans(plans, profile, 'model_cpu_offload_int4')
+        if placement.get('device_map'):
+            append_progressive_int4_plans(plans, profile, 'int4_cpu_overflow')
 
     if placement.get('sequential_cpu_offload'):
         plans.append(make_candidate_plan(profile, 'sequential_cpu_offload_native', 'native'))
@@ -8989,9 +9071,32 @@ def validate_registry():
             for precision in ['native', 'int8', 'int4']:
                 if component.get('weight_memory_gib', {}).get(precision, 0.0) <= 0:
                     errors.append(f'{key}.{component_name}: invalid {precision} memory estimate')
+        plan_ids = set()
         for plan in profile.get('candidate_plans', []):
-            if not plan.get('plan_id'):
+            plan_id = plan.get('plan_id')
+            if not plan_id:
                 errors.append(f'{key}: plan missing plan_id')
+            elif plan_id in plan_ids:
+                errors.append(f'{key}: duplicate plan_id {plan_id}')
+            else:
+                plan_ids.add(plan_id)
+
+            for component_name, precision in plan.get('component_precision', {}).items():
+                if component_name not in profile.get('components', {}):
+                    errors.append(f'{key}.{plan_id}: unknown component {component_name}')
+                    continue
+                role = profile['components'][component_name].get('role')
+                normalized = precision
+                if precision in ['int8', '8bit', 'bnb_int8', 'native_fp8']:
+                    normalized = 'int8'
+                elif precision in ['int4', '4bit', 'bnb_nf4', 'gguf_q4_k_m', 'native_mxfp4', 'checkpoint_native_nf4']:
+                    normalized = 'int4'
+                elif precision in ['checkpoint_native', 'bfloat16', 'float16', 'float32']:
+                    normalized = 'native'
+                if normalized not in ['native', 'int8', 'int4']:
+                    errors.append(f'{key}.{plan_id}.{component_name}: unknown precision {precision}')
+                if role == 'vae' and normalized in ['int8', 'int4']:
+                    errors.append(f'{key}.{plan_id}.{component_name}: VAE quantization is not permitted')
 
     for launcher_id in LAUNCHER_MODEL_IDS:
         if launcher_id not in MODEL_ALIASES:

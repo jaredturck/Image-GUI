@@ -1,12 +1,13 @@
-import os, dotenv
+import os
+import dotenv
 
 dotenv.load_dotenv()
-if os.environ['USE_HHD'] == 'True':
-    os.environ["HF_HOME"] = "/mnt/8TB_HDD/hf_cache"
-    os.environ["HF_HUB_CACHE"] = "/mnt/8TB_HDD/hf_cache/hub"
-    os.environ["TRANSFORMERS_CACHE"] = "/mnt/8TB_HDD/hf_cache/hub"
 
-import os, sys, json, threading, torch, time, gc, random, cv2
+from app_config import apply_runtime_environment, resolve_output_path
+
+apply_runtime_environment()
+
+import sys, json, threading, torch, time, gc, random, cv2
 import customtkinter as ctk
 from tkinter import filedialog
 from PIL import Image
@@ -16,6 +17,7 @@ from pynvml import nvmlDeviceGetCurrentClocksThrottleReasons
 from pynvml import nvmlClocksThrottleReasonHwThermalSlowdown, nvmlClocksThrottleReasonSwThermalSlowdown
 from comfy_script.runtime import Workflow, util
 import io, shutil, subprocess
+from planner_runtime import clear_accelerator_cache, get_active_plan, is_exact_fast_path, mark_success, preview_device, run_guarded, workload_from_diffusion_gui
 
 class DiffusionGUI:
 
@@ -27,7 +29,7 @@ class DiffusionGUI:
         for arg in args:
             setattr(self, arg, args[arg])
 
-        self.image_folder = self.image_folder
+        self.image_folder = resolve_output_path(self.image_folder)
         os.makedirs(self.image_folder, exist_ok=True)
 
         config_prompt = None
@@ -77,6 +79,16 @@ class DiffusionGUI:
         self.backend = hasattr(self, 'backend') and self.backend or "diffusers"
         self.comfy_nodes = None
         self.active_seed = None
+        self.active_plan = get_active_plan()
+        if self.active_plan and not is_exact_fast_path(self.active_plan):
+            self.vram_estimator = None
+        if self.active_plan.get("restore_workload"):
+            for key, value in self.active_plan.get("workload", {}).items():
+                if hasattr(self, key) and isinstance(value, (int, float, str, bool)):
+                    setattr(self, key, value)
+        self.plan_status_label = None
+        self.plan_phase = "Starting"
+        self.plan_validated = False
 
         self.prompt_pipe = None
         self.prompt_tokenizer = None
@@ -136,11 +148,36 @@ class DiffusionGUI:
         self.thermal_poll_ms = 30000
         self.thermal_poll_id = None
 
-        nvmlInit()
-        self.gpu_handles = [nvmlDeviceGetHandleByIndex(i) for i in range(nvmlDeviceGetCount())]
+        self.gpu_handles = []
+        if torch.cuda.is_available():
+            try:
+                nvmlInit()
+                self.gpu_handles = [nvmlDeviceGetHandleByIndex(i) for i in range(nvmlDeviceGetCount())]
+            except Exception as error:
+                print(f"NVML unavailable: {error}")
 
-        threading.Thread(target=self.load_model).start()
+        self.model_load_started = False
     
+    def update_plan_status(self, phase=None):
+        if phase:
+            self.plan_phase = phase
+        if self.plan_status_label is None:
+            return
+        plan_text = self.active_plan.get("status_text", "Legacy loading path") if self.active_plan else "Legacy loading path"
+        self.plan_status_label.configure(text=f"Plan: {plan_text} · {self.plan_phase}")
+
+    def load_model_guarded(self):
+        self.app.after(0, self.update_plan_status, "Loading model")
+        workload = workload_from_diffusion_gui(self)
+        result = run_guarded(self.active_plan, "model_loading", workload, self.load_model)
+        self.app.after(0, self.update_plan_status, "Ready")
+        return result
+
+    def generate_guarded(self):
+        workload = workload_from_diffusion_gui(self)
+        self.app.after(0, self.update_plan_status, "Generating")
+        return run_guarded(self.active_plan, "inference", workload, self.generate)
+
     def set_prompt_text(self, text):
         self.prompt_box.delete("1.0", "end")
         self.prompt_box.insert("1.0", text)
@@ -223,13 +260,7 @@ class DiffusionGUI:
         subprocess.Popen(["xdg-open", path])
     
     def clear_cuda_cache(self):
-        gc.collect()
-        if not torch.cuda.is_available():
-            return
-        for i in range(torch.cuda.device_count()):
-            torch.cuda.set_device(i)
-            torch.cuda.empty_cache()
-            torch.cuda.ipc_collect()
+        clear_accelerator_cache()
     
     def open_output_folder(self):
         os.makedirs(self.image_folder, exist_ok=True)
@@ -298,7 +329,7 @@ class DiffusionGUI:
                     time.sleep(0.2)
                 return
 
-            return self.load_model()
+            return self.load_model_guarded()
 
         if self.pipe is not None:
             return
@@ -308,7 +339,7 @@ class DiffusionGUI:
                 time.sleep(0.2)
             return
 
-        self.load_model()
+        self.load_model_guarded()
 
     def sync_params(self, event=None):
         self.prompt = self.prompt_box.get("1.0", "end").strip()
@@ -503,7 +534,7 @@ class DiffusionGUI:
                 elif x.ndim == 3:
                     x = self.unpack_flux_latents(x, self.height, self.width)
 
-                x = x[:1].to("cuda:1", dtype=self.preview_vae.dtype)
+                x = x[:1].to(preview_device(self.active_plan), dtype=self.preview_vae.dtype)
                 x = x / self.preview_vae.config.scaling_factor
                 if hasattr(self.preview_vae.config, "shift_factor"):
                     x = x + self.preview_vae.config.shift_factor
@@ -529,15 +560,15 @@ class DiffusionGUI:
     
     def get_gpu_percent(self):
         vals = []
-        for h in self.gpu_handles:
-            vals.append(nvmlDeviceGetUtilizationRates(h).gpu)
-        return max(vals)
+        for handle in self.gpu_handles:
+            vals.append(nvmlDeviceGetUtilizationRates(handle).gpu)
+        return max(vals) if vals else 0
     
     def get_thermal_throttling(self):
         thermal_reasons = nvmlClocksThrottleReasonHwThermalSlowdown | nvmlClocksThrottleReasonSwThermalSlowdown
 
-        for h in self.gpu_handles:
-            reasons = nvmlDeviceGetCurrentClocksThrottleReasons(h)
+        for handle in self.gpu_handles:
+            reasons = nvmlDeviceGetCurrentClocksThrottleReasons(handle)
             if reasons & thermal_reasons:
                 return True
 
@@ -743,9 +774,20 @@ class DiffusionGUI:
         prompt_header.grid_columnconfigure(0, weight=1)
         prompt_header.grid_columnconfigure(1, weight=0)
         prompt_header.grid_columnconfigure(2, weight=0)
+        prompt_header.grid_rowconfigure(1, weight=0)
 
         prompt_title = ctk.CTkLabel(prompt_header, text="Prompt", font=ctk.CTkFont(size=18, weight="bold"))
         prompt_title.grid(row=0, column=0, sticky="w")
+
+        plan_text = self.active_plan.get("status_text", "Legacy loading path") if self.active_plan else "Legacy loading path"
+        self.plan_status_label = ctk.CTkLabel(
+            prompt_header,
+            text=f"Plan: {plan_text}",
+            text_color="#a8a8a8",
+            font=ctk.CTkFont(size=11),
+            anchor="w",
+        )
+        self.plan_status_label.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(4, 0))
 
         gpu_column = 1
         if self.use_prompt_model:
@@ -1020,6 +1062,10 @@ class DiffusionGUI:
         self.app.bind_all("<MouseWheel>", self.on_mousewheel)
         self.app.bind_all("<Button-4>", self.on_mousewheel)
         self.app.bind_all("<Button-5>", self.on_mousewheel)
+
+        if not self.model_load_started:
+            self.model_load_started = True
+            threading.Thread(target=self.load_model_guarded, daemon=True).start()
     
     def set_generate_busy(self):
         self.generate_btn.configure(text="In progress", state="disabled", fg_color="#444444", hover_color="#444444", text_color="#d0d0d0")
@@ -1039,6 +1085,12 @@ class DiffusionGUI:
         self.set_generate_idle()
     
     def finish_generate(self):
+        completed = self.progress >= 0.999 and not self.stop_requested
+        if completed and self.active_plan and not self.plan_validated:
+            mark_success(self.active_plan, workload_from_diffusion_gui(self))
+            self.plan_validated = True
+            self.update_plan_status("Validated on this computer")
+
         self.generate_running = False
         self.stop_requested = False
         self.thermal_throttling = False
@@ -1125,7 +1177,7 @@ class DiffusionGUI:
         self.progress_total = self.callback_on_step_end and self.num_inference_steps or self.get_total_runs()
         self.update_progress_widgets()
 
-        t1 = threading.Thread(target=self.generate, daemon=True)
+        t1 = threading.Thread(target=self.generate_guarded, daemon=True)
         t1.start()
     
     def fit_size_constraints(self, width, height):

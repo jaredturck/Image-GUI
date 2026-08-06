@@ -1,13 +1,15 @@
-import os, dotenv
+import os
+import dotenv
 
 dotenv.load_dotenv()
-if os.environ['USE_HHD'] == 'True':
-    os.environ["HF_HOME"] = "/mnt/8TB_HDD/hf_cache"
-    os.environ["HF_HUB_CACHE"] = "/mnt/8TB_HDD/hf_cache/hub"
-    os.environ["TRANSFORMERS_CACHE"] = "/mnt/8TB_HDD/hf_cache/hub"
+
+from app_config import apply_runtime_environment, get_path
+
+apply_runtime_environment()
 
 import torch, sys, inspect
 from diffusers import ZImagePipeline, Kandinsky5T2IPipeline, AutoencoderKL, PixArtSigmaPipeline, StableDiffusion3Pipeline, FluxPipeline
+from diffusers import Flux2Pipeline, GlmImagePipeline, QwenImagePipeline, ChronoEditPipeline
 from diffusers import Kandinsky5I2IPipeline, Kandinsky5I2VPipeline
 from transformers import AutoConfig, AutoModelForImageSegmentation, pipeline
 try:
@@ -32,6 +34,7 @@ from huggingface_hub import hf_hub_download
 from basicsr.archs.rrdbnet_arch import RRDBNet
 from realesrgan import RealESRGANer
 from diffusers import StableDiffusionUpscalePipeline
+from planner_runtime import execution_device, get_active_plan, is_cuda_plan, is_exact_fast_path, load_component, load_diffusers_pipeline, plan_placement, prepare_preview_vae, torch_dtype
 
 class ZImageTurboGUI(DiffusionGUI):
     def __init__(self):
@@ -53,11 +56,15 @@ class ZImageTurboGUI(DiffusionGUI):
                 return
             self.model_loading = True
 
-        pipe = ZImagePipeline.from_pretrained(
-            "Tongyi-MAI/Z-Image-Turbo",
-            torch_dtype=torch.bfloat16,
-            device_map='balanced',
-            max_memory={0: '22GiB', 1: '22GiB', 'cpu': '80GiB'}
+        model_id = "Tongyi-MAI/Z-Image-Turbo"
+        pipe = load_diffusers_pipeline(
+            ZImagePipeline,
+            model_id,
+            current_kwargs={
+                "torch_dtype": torch.bfloat16,
+                "device_map": "balanced",
+                "max_memory": {0: "22GiB", 1: "22GiB", "cpu": "80GiB"},
+            },
         )
 
         with self.model_lock:
@@ -83,34 +90,33 @@ class Kandinsky5T2ILiteSFTGUI(DiffusionGUI):
 
     def load_model(self):
         with self.model_lock:
-            if self.pipe is not None and self.preview_vae is not None:
+            if self.pipe is not None:
                 return
             self.model_loading = True
 
         model_id = "kandinskylab/Kandinsky-5.0-T2I-Lite-sft-Diffusers"
-
-        pipe = Kandinsky5T2IPipeline.from_pretrained(
+        pipe = load_diffusers_pipeline(
+            Kandinsky5T2IPipeline,
             model_id,
-            torch_dtype=torch.bfloat16,
-            device_map="balanced",
-            max_memory={0: "22GiB", 1: "22GiB", "cpu": "80GiB"}
+            current_kwargs={
+                "torch_dtype": torch.bfloat16,
+                "device_map": "balanced",
+                "max_memory": {0: "22GiB", 1: "22GiB", "cpu": "80GiB"},
+            },
         )
-
-        preview_vae = AutoencoderKL.from_pretrained(
+        preview_vae = prepare_preview_vae(
+            AutoencoderKL,
             model_id,
-            subfolder="vae",
-            torch_dtype=torch.float16,
-        ).to("cuda:1")
-
-        preview_vae.enable_slicing()
-        preview_vae.enable_tiling()
-        preview_vae.eval()
+            {"subfolder": "vae", "torch_dtype": torch.float16},
+        )
+        if preview_vae is not None:
+            preview_vae.enable_slicing()
+            preview_vae.enable_tiling()
+            preview_vae.eval()
 
         with self.model_lock:
             self.pipe = pipe
             self.preview_vae = preview_vae
-
-        with self.model_lock:
             self.model_loading = False
 
 class PixArtSigmaGUI(DiffusionGUI):
@@ -135,11 +141,14 @@ class PixArtSigmaGUI(DiffusionGUI):
                 return
             self.model_loading = True
 
-        self.pipe = PixArtSigmaPipeline.from_pretrained(
+        self.pipe = load_diffusers_pipeline(
+            PixArtSigmaPipeline,
             "PixArt-alpha/PixArt-Sigma-XL-2-1024-MS",
-            torch_dtype=torch.bfloat16,
-            device_map='balanced',
-            max_memory={0: "22GiB", 1: "22GiB", 'cpu': "80GiB"},
+            current_kwargs={
+                "torch_dtype": torch.bfloat16,
+                "device_map": "balanced",
+                "max_memory": {0: "22GiB", 1: "22GiB", "cpu": "80GiB"},
+            },
         )
 
         with self.model_lock:
@@ -156,7 +165,7 @@ class AnimaGUI(DiffusionGUI):
                 'max_sequence_length': 512,
                 'backend': "comfy",
                 'callback_on_step_end': False,
-                'comfyui_dir': "/home/jared/comfy/ComfyUI/",
+                'comfyui_dir': get_path("comfyui_dir"),
                 'unet_name': "anima-preview.safetensors",
                 'clip_name': "qwen_3_06b_base.safetensors",
                 'clip_type': "qwen_image",
@@ -202,34 +211,33 @@ class StableDiffusion35GUI(DiffusionGUI):
 
     def load_model(self):
         with self.model_lock:
-            if self.pipe is not None and self.preview_vae is not None:
+            if self.pipe is not None:
                 return
             self.model_loading = True
 
         model_id = "stabilityai/stable-diffusion-3.5-large"
-
-        pipe = StableDiffusion3Pipeline.from_pretrained(
+        pipe = load_diffusers_pipeline(
+            StableDiffusion3Pipeline,
             model_id,
-            torch_dtype=torch.bfloat16,
-            device_map="balanced",
-            max_memory={0: "22GiB", 1: "22GiB", "cpu": "80GB"}
+            current_kwargs={
+                "torch_dtype": torch.bfloat16,
+                "device_map": "balanced",
+                "max_memory": {0: "22GiB", 1: "22GiB", "cpu": "80GB"},
+            },
         )
-
-        preview_vae = AutoencoderKL.from_pretrained(
+        preview_vae = prepare_preview_vae(
+            AutoencoderKL,
             model_id,
-            subfolder="vae",
-            torch_dtype=torch.float16,
-        ).to("cuda:1")
-
-        preview_vae.enable_slicing()
-        preview_vae.enable_tiling()
-        preview_vae.eval()
+            {"subfolder": "vae", "torch_dtype": torch.float16},
+        )
+        if preview_vae is not None:
+            preview_vae.enable_slicing()
+            preview_vae.enable_tiling()
+            preview_vae.eval()
 
         with self.model_lock:
             self.pipe = pipe
             self.preview_vae = preview_vae
-
-        with self.model_lock:
             self.model_loading = False
 
 class BlackForestFluxGUI(DiffusionGUI):
@@ -250,34 +258,33 @@ class BlackForestFluxGUI(DiffusionGUI):
 
     def load_model(self):
         with self.model_lock:
-            if self.pipe is not None and self.preview_vae is not None:
+            if self.pipe is not None:
                 return
             self.model_loading = True
 
         model_id = "black-forest-labs/FLUX.1-dev"
-
-        pipe = FluxPipeline.from_pretrained(
+        pipe = load_diffusers_pipeline(
+            FluxPipeline,
             model_id,
-            torch_dtype=torch.bfloat16,
-            device_map='balanced',
-            max_memory={0: "22GiB", 1: "22GiB", 'cpu' : '80GiB'},
+            current_kwargs={
+                "torch_dtype": torch.bfloat16,
+                "device_map": "balanced",
+                "max_memory": {0: "22GiB", 1: "22GiB", "cpu": "80GiB"},
+            },
         )
-
-        preview_vae = AutoencoderKL.from_pretrained(
+        preview_vae = prepare_preview_vae(
+            AutoencoderKL,
             model_id,
-            subfolder="vae",
-            torch_dtype=torch.float16,
-        ).to("cuda:1")
-
-        preview_vae.enable_slicing()
-        preview_vae.enable_tiling()
-        preview_vae.eval()
+            {"subfolder": "vae", "torch_dtype": torch.float16},
+        )
+        if preview_vae is not None:
+            preview_vae.enable_slicing()
+            preview_vae.enable_tiling()
+            preview_vae.eval()
 
         with self.model_lock:
             self.pipe = pipe
             self.preview_vae = preview_vae
-
-        with self.model_lock:
             self.model_loading = False
 
 class GLMImageGUI(DiffusionGUI):
@@ -302,12 +309,19 @@ class GLMImageGUI(DiffusionGUI):
                 return
             self.model_loading = True
 
-        pipe = GLMImageGenerator()
+        placement = plan_placement(self.active_plan)
+        if is_exact_fast_path(self.active_plan):
+            pipe = GLMImageGenerator(plan=self.active_plan)
+        else:
+            pipe = load_diffusers_pipeline(
+                GlmImagePipeline,
+                "zai-org/GLM-Image",
+                current_kwargs={"torch_dtype": torch.bfloat16},
+                plan=self.active_plan,
+            )
 
         with self.model_lock:
             self.pipe = pipe
-
-        with self.model_lock:
             self.model_loading = False
 
 class QwenImageGUI(DiffusionGUI):
@@ -332,13 +346,21 @@ class QwenImageGUI(DiffusionGUI):
                 return
             self.model_loading = True
 
-        pipe = QwenImageGenerator()
+        if is_exact_fast_path(self.active_plan):
+            pipe = QwenImageGenerator(plan=self.active_plan)
+        else:
+            pipe = load_diffusers_pipeline(
+                QwenImagePipeline,
+                "Qwen/Qwen-Image",
+                current_kwargs={"torch_dtype": torch.bfloat16},
+                plan=self.active_plan,
+            )
+            pipe.vae.enable_tiling()
+            pipe.vae.enable_slicing()
 
         with self.model_lock:
             self.pipe = pipe
             self.preview_vae = None
-
-        with self.model_lock:
             self.model_loading = False
 
 class BlackForestFlux2GUI(DiffusionGUI):
@@ -368,7 +390,17 @@ class BlackForestFlux2GUI(DiffusionGUI):
                 return
             self.model_loading = True
 
-        pipe = Flux2Generator()
+        placement = plan_placement(self.active_plan)
+        if is_exact_fast_path(self.active_plan) or "model_specific_staging" in placement:
+            pipe = Flux2Generator(plan=self.active_plan)
+        else:
+            pipe = load_diffusers_pipeline(
+                Flux2Pipeline,
+                "black-forest-labs/FLUX.2-dev",
+                current_kwargs={"torch_dtype": torch.bfloat16},
+                plan=self.active_plan,
+            )
+            pipe.vae.enable_tiling()
 
         with self.model_lock:
             self.pipe = pipe
@@ -468,31 +500,26 @@ class SkyReelsV2GUI(DiffusionGUI):
             self.model_loading = True
 
         model_id = "Skywork/SkyReels-V2-DF-1.3B-540P-Diffusers"
-
-        vae = AutoModel.from_pretrained(
+        vae = load_component(
+            AutoModel,
             model_id,
-            subfolder="vae",
-            torch_dtype=torch.float32
+            "vae",
+            current_kwargs={"subfolder": "vae", "torch_dtype": torch.float32},
+            portable_base_kwargs={"subfolder": "vae"},
         )
-
-        pipe = SkyReelsV2DiffusionForcingPipeline.from_pretrained(
+        pipe = load_diffusers_pipeline(
+            SkyReelsV2DiffusionForcingPipeline,
             model_id,
-            vae=vae,
-            torch_dtype=torch.bfloat16,
+            current_kwargs={"vae": vae, "torch_dtype": torch.bfloat16},
+            portable_base_kwargs={"vae": vae},
         )
-
-        pipe.scheduler = UniPCMultistepScheduler.from_config(
-            pipe.scheduler.config,
-            flow_shift=self.flow_shift
-        )
-
-        pipe.enable_model_cpu_offload()
+        pipe.scheduler = UniPCMultistepScheduler.from_config(pipe.scheduler.config, flow_shift=self.flow_shift)
+        if is_exact_fast_path(self.active_plan):
+            pipe.enable_model_cpu_offload()
 
         with self.model_lock:
             self.pipe = pipe
             self.preview_vae = None
-
-        with self.model_lock:
             self.model_loading = False
 
     def generate_diffusers(self):
@@ -598,27 +625,28 @@ class Kandinsky5T2VLiteDistilled16GUI(DiffusionGUI):
                 return
             self.model_loading = True
 
-        flex_attention.flex_attention = torch.compile(
-            flex_attention.flex_attention,
-            mode='max-autotune-no-cudagraphs',
-            dynamic=True,
-        )
-
-        pipe = Kandinsky5T2VPipeline.from_pretrained(
+        if is_cuda_plan(self.active_plan):
+            flex_attention.flex_attention = torch.compile(
+                flex_attention.flex_attention,
+                mode="max-autotune-no-cudagraphs",
+                dynamic=True,
+            )
+        pipe = load_diffusers_pipeline(
+            Kandinsky5T2VPipeline,
             self.model_id,
-            torch_dtype=torch.bfloat16,
-            device_map='balanced',
-            max_memory={0: '22GB', 1: '22GB', 'cpu': '80GB'},
+            current_kwargs={
+                "torch_dtype": torch.bfloat16,
+                "device_map": "balanced",
+                "max_memory": {0: "22GB", 1: "22GB", "cpu": "80GB"},
+            },
         )
-
-        pipe.transformer.set_attention_backend('flex')
+        if is_cuda_plan(self.active_plan):
+            pipe.transformer.set_attention_backend("flex")
         pipe.vae.enable_tiling()
         pipe.vae.enable_slicing()
 
         with self.model_lock:
             self.pipe = pipe
-
-        with self.model_lock:
             self.model_loading = False
 
     def on_step_end(self, pipe, step, timestep, callback_kwargs):
@@ -733,18 +761,17 @@ class CosmosPredict2V2WGUI(DiffusionGUI):
                 return
             self.model_loading = True
 
-        pipe = Cosmos2VideoToWorldPipeline.from_pretrained(
+        pipe = load_diffusers_pipeline(
+            Cosmos2VideoToWorldPipeline,
             self.model_id,
-            torch_dtype=torch.bfloat16,
+            current_kwargs={"torch_dtype": torch.bfloat16},
         )
-
         pipe._exclude_from_cpu_offload = ["safety_checker"]
-        pipe.enable_model_cpu_offload()
+        if is_exact_fast_path(self.active_plan):
+            pipe.enable_model_cpu_offload()
 
         with self.model_lock:
             self.pipe = pipe
-
-        with self.model_lock:
             self.model_loading = False
 
     def generate_diffusers(self):
@@ -845,26 +872,27 @@ class AllegroGUI(DiffusionGUI):
                 return
             self.model_loading = True
 
-        vae = AutoencoderKLAllegro.from_pretrained(
-            "rhymes-ai/Allegro",
-            subfolder="vae",
-            torch_dtype=torch.float32
+        model_id = "rhymes-ai/Allegro"
+        vae = load_component(
+            AutoencoderKLAllegro,
+            model_id,
+            "vae",
+            current_kwargs={"subfolder": "vae", "torch_dtype": torch.float32},
+            portable_base_kwargs={"subfolder": "vae"},
         )
-
-        pipe = AllegroPipeline.from_pretrained(
-            "rhymes-ai/Allegro",
-            vae=vae,
-            torch_dtype=torch.bfloat16
+        pipe = load_diffusers_pipeline(
+            AllegroPipeline,
+            model_id,
+            current_kwargs={"vae": vae, "torch_dtype": torch.bfloat16},
+            portable_base_kwargs={"vae": vae},
         )
-
         pipe.vae.enable_tiling()
-        pipe.enable_model_cpu_offload()
+        if is_exact_fast_path(self.active_plan):
+            pipe.enable_model_cpu_offload()
 
         with self.model_lock:
             self.pipe = pipe
             self.preview_vae = None
-
-        with self.model_lock:
             self.model_loading = False
 
     def generate_diffusers(self):
@@ -959,19 +987,20 @@ class CogVideoXGUI(DiffusionGUI):
                 return
             self.model_loading = True
 
-        pipe = CogVideoXPipeline.from_pretrained(
+        pipe = load_diffusers_pipeline(
+            CogVideoXPipeline,
             "THUDM/CogVideoX-5b",
-            torch_dtype=torch.bfloat16,
-            device_map="balanced",
-            max_memory={0: "22GB", 1: "22GB", "cpu": "80GB"},
+            current_kwargs={
+                "torch_dtype": torch.bfloat16,
+                "device_map": "balanced",
+                "max_memory": {0: "22GB", 1: "22GB", "cpu": "80GB"},
+            },
         )
         pipe.vae.enable_tiling()
 
         with self.model_lock:
             self.pipe = pipe
             self.preview_vae = None
-
-        with self.model_lock:
             self.model_loading = False
 
     def on_step_end(self, pipe, step, timestep, callback_kwargs):
@@ -1078,28 +1107,25 @@ class HunyuanVideoGUI(DiffusionGUI):
                 return
             self.model_loading = True
 
-        pipe = HunyuanVideo15Pipeline.from_pretrained(
+        pipe = load_diffusers_pipeline(
+            HunyuanVideo15Pipeline,
             "hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-720p_t2v",
-            torch_dtype=torch.bfloat16,
-            device_map="balanced",
-            max_memory={0: "22GiB", 1: "22GiB", "cpu": "80GiB"},
+            current_kwargs={
+                "torch_dtype": torch.bfloat16,
+                "device_map": "balanced",
+                "max_memory": {0: "22GiB", 1: "22GiB", "cpu": "80GiB"},
+            },
         )
         pipe.vae.enable_tiling()
         pipe.vae.enable_slicing()
-
-        supports_callback = False
-        sig = inspect.signature(pipe.__call__)
-        params = sig.parameters
-        if "callback_on_step_end" in params and "callback_on_step_end_tensor_inputs" in params:
-            supports_callback = True
+        signature = inspect.signature(pipe.__call__)
+        supports_callback = "callback_on_step_end" in signature.parameters and "callback_on_step_end_tensor_inputs" in signature.parameters
 
         with self.model_lock:
             self.pipe = pipe
             self.preview_vae = None
             self.supports_callback = supports_callback
             self.callback_on_step_end = supports_callback
-
-        with self.model_lock:
             self.model_loading = False
 
     def on_step_end(self, pipe, step, timestep, callback_kwargs):
@@ -1232,19 +1258,21 @@ class Kandinsky5T2VProDistilled5sGUI(DiffusionGUI):
                 return
             self.model_loading = True
 
-        flex_attention.flex_attention = torch.compile(
-            flex_attention.flex_attention,
-            mode="max-autotune-no-cudagraphs",
-            dynamic=True,
-        )
-
-        pipe = Kandinsky5T2VPipeline.from_pretrained(
+        if is_cuda_plan(self.active_plan):
+            flex_attention.flex_attention = torch.compile(
+                flex_attention.flex_attention,
+                mode="max-autotune-no-cudagraphs",
+                dynamic=True,
+            )
+        pipe = load_diffusers_pipeline(
+            Kandinsky5T2VPipeline,
             self.model_id,
-            torch_dtype=torch.bfloat16,
+            current_kwargs={"torch_dtype": torch.bfloat16},
         )
-
-        pipe.enable_sequential_cpu_offload()
-        pipe.transformer.set_attention_backend("flex")
+        if is_exact_fast_path(self.active_plan):
+            pipe.enable_sequential_cpu_offload()
+        if is_cuda_plan(self.active_plan):
+            pipe.transformer.set_attention_backend("flex")
         pipe.vae.enable_tiling()
         pipe.vae.enable_slicing()
 
@@ -1381,19 +1409,21 @@ class Kandinsky5T2VProSFT5sGUI(DiffusionGUI):
                 return
             self.model_loading = True
 
-        flex_attention.flex_attention = torch.compile(
-            flex_attention.flex_attention,
-            mode="max-autotune-no-cudagraphs",
-            dynamic=True,
-        )
-
-        pipe = Kandinsky5T2VPipeline.from_pretrained(
+        if is_cuda_plan(self.active_plan):
+            flex_attention.flex_attention = torch.compile(
+                flex_attention.flex_attention,
+                mode="max-autotune-no-cudagraphs",
+                dynamic=True,
+            )
+        pipe = load_diffusers_pipeline(
+            Kandinsky5T2VPipeline,
             self.model_id,
-            torch_dtype=torch.bfloat16,
+            current_kwargs={"torch_dtype": torch.bfloat16},
         )
-
-        pipe.enable_sequential_cpu_offload()
-        pipe.transformer.set_attention_backend("flex")
+        if is_exact_fast_path(self.active_plan):
+            pipe.enable_sequential_cpu_offload()
+        if is_cuda_plan(self.active_plan):
+            pipe.transformer.set_attention_backend("flex")
         pipe.vae.enable_tiling()
         pipe.vae.enable_slicing()
 
@@ -1502,17 +1532,17 @@ class Kandinsky5I2IGUI(DiffusionGUI):
                 return
             self.model_loading = True
 
-        pipe = Kandinsky5I2IPipeline.from_pretrained(
+        pipe = load_diffusers_pipeline(
+            Kandinsky5I2IPipeline,
             "kandinskylab/Kandinsky-5.0-I2I-Lite-sft-Diffusers",
-            torch_dtype=torch.bfloat16,
+            current_kwargs={"torch_dtype": torch.bfloat16},
         )
-        pipe.enable_model_cpu_offload()
+        if is_exact_fast_path(self.active_plan):
+            pipe.enable_model_cpu_offload()
 
         with self.model_lock:
             self.pipe = pipe
             self.preview_vae = None
-
-        with self.model_lock:
             self.model_loading = False
 
 class Kandinsky5I2VGUI(DiffusionGUI):
@@ -1561,35 +1591,33 @@ class Kandinsky5I2VGUI(DiffusionGUI):
                 return
             self.model_loading = True
 
-        flex_attention.flex_attention = torch.compile(
-            flex_attention.flex_attention,
-            mode='max-autotune-no-cudagraphs',
-            dynamic=True,
-        )
-
-        pipe = Kandinsky5I2VPipeline.from_pretrained(
+        if is_cuda_plan(self.active_plan):
+            flex_attention.flex_attention = torch.compile(
+                flex_attention.flex_attention,
+                mode="max-autotune-no-cudagraphs",
+                dynamic=True,
+            )
+        pipe = load_diffusers_pipeline(
+            Kandinsky5I2VPipeline,
             self.model_id,
-            torch_dtype=torch.bfloat16,
-            device_map='balanced',
-            max_memory={0: '22GiB', 1: '22GiB', 'cpu': '80GiB'}
+            current_kwargs={
+                "torch_dtype": torch.bfloat16,
+                "device_map": "balanced",
+                "max_memory": {0: "22GiB", 1: "22GiB", "cpu": "80GiB"},
+            },
         )
-        pipe.transformer.set_attention_backend('flex')
+        if is_cuda_plan(self.active_plan):
+            pipe.transformer.set_attention_backend("flex")
         pipe.vae.enable_tiling()
         pipe.vae.enable_slicing()
-
-        supports_callback = False
-        sig = inspect.signature(pipe.__call__)
-        params = sig.parameters
-        if "callback_on_step_end" in params and "callback_on_step_end_tensor_inputs" in params:
-            supports_callback = True
+        signature = inspect.signature(pipe.__call__)
+        supports_callback = "callback_on_step_end" in signature.parameters and "callback_on_step_end_tensor_inputs" in signature.parameters
 
         with self.model_lock:
             self.pipe = pipe
             self.preview_vae = None
             self.supports_callback = supports_callback
             self.callback_on_step_end = supports_callback
-
-        with self.model_lock:
             self.model_loading = False
 
     def on_step_end(self, pipe, step, timestep, callback_kwargs):
@@ -1727,10 +1755,29 @@ class Kandinsky5I2VProSFT5sGUI(DiffusionGUI):
                 return
             self.model_loading = True
 
-        pipe = Kandinsky5I2VGenerator()
+        placement = plan_placement(self.active_plan)
+        if is_exact_fast_path(self.active_plan) or "model_specific_staging" in placement:
+            pipe = Kandinsky5I2VGenerator(plan=self.active_plan)
+            supports_callback = True
+        else:
+            pipe = load_diffusers_pipeline(
+                Kandinsky5I2VPipeline,
+                self.model_id,
+                current_kwargs={"torch_dtype": torch.bfloat16},
+                plan=self.active_plan,
+            )
+            pipe.vae.enable_tiling()
+            pipe.vae.enable_slicing()
+            signature = inspect.signature(pipe.__call__)
+            supports_callback = (
+                "callback_on_step_end" in signature.parameters
+                and "callback_on_step_end_tensor_inputs" in signature.parameters
+            )
 
         with self.model_lock:
             self.pipe = pipe
+            self.supports_callback = supports_callback
+            self.callback_on_step_end = supports_callback
             self.model_loading = False
 
     def on_step_end(self, pipe, step, timestep, callback_kwargs):
@@ -1854,14 +1901,66 @@ class ChronoEditGUI(DiffusionGUI):
                 return
             self.model_loading = True
 
-        pipe = ChronoEditGenerator()
+        if is_exact_fast_path(self.active_plan):
+            pipe = ChronoEditGenerator(plan=self.active_plan)
+        else:
+            pipe = load_diffusers_pipeline(
+                ChronoEditPipeline,
+                "nvidia/ChronoEdit-14B-Diffusers",
+                current_kwargs={"torch_dtype": torch.bfloat16},
+                plan=self.active_plan,
+            )
+            pipe.vae.enable_tiling()
+            pipe.vae.enable_slicing()
 
         with self.model_lock:
             self.pipe = pipe
             self.preview_vae = None
-
-        with self.model_lock:
             self.model_loading = False
+
+    def generate_diffusers(self):
+        stopped = False
+        for index in range(self.batch_size):
+            if self.stop_requested:
+                stopped = True
+                break
+
+            self.prepare_run_seed()
+            self.progress = 0.0
+            self.progress_step = 0
+            self.progress_total = self.num_inference_steps
+            self.app.after(0, self.update_progress_widgets)
+
+            args = {name: getattr(self, name) for name in self.pipeline_args}
+            if self.source_image_pil is not None:
+                args["image"] = self.source_image_pil.copy()
+            args["generator"] = self.get_generator()
+
+            output = self.pipe(**args)
+            images = getattr(output, "images", None)
+            if images is None:
+                frames = getattr(output, "frames", [])
+                images = []
+                for video in frames:
+                    image = video[-1]
+                    if not isinstance(image, Image.Image):
+                        image = np.asarray(image)
+                        if image.dtype != np.uint8:
+                            image = (image * 255).clip(0, 255).astype(np.uint8)
+                        image = Image.fromarray(image)
+                    images.append(image)
+
+            for image_index, image in enumerate(images or []):
+                filename = f"output_{int(time.time())}_{index}_{image_index}.png"
+                output_path = os.path.join(self.image_folder, filename)
+                image.save(output_path)
+                self.app.after(0, self.set_preview_image, image.copy())
+
+        if not stopped:
+            self.progress = 1.0
+            self.progress_step = self.progress_total
+            self.app.after(0, self.update_progress_widgets)
+        self.app.after(0, self.finish_generate)
 
 
 class QwenImageEditGUI(DiffusionGUI):
@@ -1907,13 +2006,22 @@ class QwenImageEditGUI(DiffusionGUI):
                 return
             self.model_loading = True
 
-        pipe = QwenImageEditGenerator()
+        placement = plan_placement(self.active_plan)
+        if is_exact_fast_path(self.active_plan) or "model_specific_staging" in placement:
+            pipe = QwenImageEditGenerator(plan=self.active_plan)
+        else:
+            pipe = load_diffusers_pipeline(
+                QwenImageEditPlusPipeline,
+                "ovedrive/Qwen-Image-Edit-2511-4bit",
+                current_kwargs={"torch_dtype": torch.bfloat16},
+                plan=self.active_plan,
+            )
+            pipe.vae.enable_tiling()
+            pipe.vae.enable_slicing()
 
         with self.model_lock:
             self.pipe = pipe
             self.preview_vae = None
-
-        with self.model_lock:
             self.model_loading = False
 
 def _rmbg_all_tied_weights_keys(self):
@@ -1964,29 +2072,25 @@ class RMBG14GUI(DiffusionGUI):
             self.model_loading = True
 
         model_id = "briaai/RMBG-1.4"
-        device = 0 if torch.cuda.is_available() else -1
-
+        device = execution_device(self.active_plan)
+        pipeline_device = 0 if device.startswith("cuda") else ("mps" if device == "mps" else -1)
         cfg = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
-        tmp = AutoModelForImageSegmentation.from_config(cfg, trust_remote_code=True)
-        cls = tmp.__class__
-        del tmp
-
-        if not hasattr(cls, "all_tied_weights_keys"):
-            cls.all_tied_weights_keys = property(_rmbg_all_tied_weights_keys)
-
+        temporary_model = AutoModelForImageSegmentation.from_config(cfg, trust_remote_code=True)
+        model_class = temporary_model.__class__
+        del temporary_model
+        if not hasattr(model_class, "all_tied_weights_keys"):
+            model_class.all_tied_weights_keys = property(_rmbg_all_tied_weights_keys)
         rmbg_pipe = pipeline(
             "image-segmentation",
             model=model_id,
             trust_remote_code=True,
-            device=device,
+            device=pipeline_device,
         )
 
         with self.model_lock:
             self.rmbg_pipe = rmbg_pipe
             self.pipe = rmbg_pipe
             self.preview_vae = None
-
-        with self.model_lock:
             self.model_loading = False
 
     def generate_diffusers(self):
@@ -2061,20 +2165,9 @@ class RealESRGANGUI(DiffusionGUI):
                 return
             self.model_loading = True
 
-        model = RRDBNet(
-            num_in_ch=3,
-            num_out_ch=3,
-            num_feat=64,
-            num_block=23,
-            num_grow_ch=32,
-            scale=4
-        )
-
-        weights = hf_hub_download(
-            repo_id="lllyasviel/Annotators",
-            filename="RealESRGAN_x4plus.pth"
-        )
-
+        model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=4)
+        weights = hf_hub_download(repo_id="lllyasviel/Annotators", filename="RealESRGAN_x4plus.pth")
+        use_cuda = execution_device(self.active_plan).startswith("cuda")
         upsampler = RealESRGANer(
             scale=4,
             model_path=weights,
@@ -2082,16 +2175,14 @@ class RealESRGANGUI(DiffusionGUI):
             tile=0,
             tile_pad=10,
             pre_pad=0,
-            half=True,
-            gpu_id=0,
+            half=use_cuda,
+            gpu_id=0 if use_cuda else None,
         )
 
         with self.model_lock:
             self.upsampler = upsampler
             self.pipe = upsampler
             self.preview_vae = None
-
-        with self.model_lock:
             self.model_loading = False
 
     def generate_diffusers(self):
@@ -2159,20 +2250,19 @@ class SDX4UpscalerGUI(DiffusionGUI):
                 return
             self.model_loading = True
 
-        pipe = StableDiffusionUpscalePipeline.from_pretrained(
+        pipe = load_diffusers_pipeline(
+            StableDiffusionUpscalePipeline,
             "stabilityai/stable-diffusion-x4-upscaler",
-            torch_dtype=torch.float16,
+            current_kwargs={"torch_dtype": torch.float16},
         )
-
-        pipe.enable_model_cpu_offload()
+        if is_exact_fast_path(self.active_plan):
+            pipe.enable_model_cpu_offload()
         pipe.vae.enable_tiling()
         pipe.vae.enable_slicing()
 
         with self.model_lock:
             self.pipe = pipe
             self.preview_vae = None
-
-        with self.model_lock:
             self.model_loading = False
 
 class HunyuanVideoI2VGUI(DiffusionGUI):
@@ -2219,28 +2309,25 @@ class HunyuanVideoI2VGUI(DiffusionGUI):
 
         from diffusers import HunyuanVideo15ImageToVideoPipeline
 
-        pipe = HunyuanVideo15ImageToVideoPipeline.from_pretrained(
+        pipe = load_diffusers_pipeline(
+            HunyuanVideo15ImageToVideoPipeline,
             "hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-720p_i2v",
-            torch_dtype=torch.bfloat16,
-            device_map="balanced",
-            max_memory={0: "22GiB", 1: "22GiB", "cpu": "80GiB"},
+            current_kwargs={
+                "torch_dtype": torch.bfloat16,
+                "device_map": "balanced",
+                "max_memory": {0: "22GiB", 1: "22GiB", "cpu": "80GiB"},
+            },
         )
         pipe.vae.enable_tiling()
         pipe.vae.enable_slicing()
-
-        supports_callback = False
-        sig = inspect.signature(pipe.__call__)
-        params = sig.parameters
-        if "callback_on_step_end" in params and "callback_on_step_end_tensor_inputs" in params:
-            supports_callback = True
+        signature = inspect.signature(pipe.__call__)
+        supports_callback = "callback_on_step_end" in signature.parameters and "callback_on_step_end_tensor_inputs" in signature.parameters
 
         with self.model_lock:
             self.pipe = pipe
             self.preview_vae = None
             self.supports_callback = supports_callback
             self.callback_on_step_end = supports_callback
-
-        with self.model_lock:
             self.model_loading = False
 
     def on_step_end(self, pipe, step, timestep, callback_kwargs):

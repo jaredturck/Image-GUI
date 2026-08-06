@@ -1,10 +1,20 @@
-import os, sys, subprocess, shutil, io, json, base64
+import os, sys, subprocess, shutil, io, json, base64, threading, uuid
+from copy import deepcopy
 import dotenv
+
+dotenv.load_dotenv()
+
 import customtkinter as ctk
 from PIL import Image
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from tkinter import filedialog, messagebox
 
-dotenv.load_dotenv()
+from app_config import apply_runtime_environment, config_path, load_user_config, resolve_output_path, save_user_config
+from hardware_detection import detect_hardware, hardware_summary
+from hardware_planner import plan_attempts, save_plan_file
+from planner_protocol import MEMORY_RETRY_EXIT_CODE
+
+apply_runtime_environment()
 
 MODELS = [
     ('Z Image Turbo', 'z_image_turbo', 'image', '6B'),
@@ -104,6 +114,87 @@ MODEL_PREVIEW_DIRS = {
     "kandinsky_5_i2v_pro_sft": "kandinsky_i2v_pro/",
 }
 
+
+class SettingsDialog:
+    def __init__(self, parent, on_saved=None, first_run=False):
+        self.parent = parent
+        self.on_saved = on_saved
+        self.config = load_user_config()
+        self.entries = {}
+
+        self.window = ctk.CTkToplevel(parent)
+        self.window.title("Application paths")
+        self.window.geometry("720x360")
+        self.window.minsize(680, 330)
+        self.window.transient(parent)
+        self.window.grab_set()
+        self.window.grid_columnconfigure(0, weight=1)
+
+        title_text = "First-run setup" if first_run else "Application paths"
+        title = ctk.CTkLabel(self.window, text=title_text, font=ctk.CTkFont(size=21, weight="bold"))
+        title.grid(row=0, column=0, sticky="w", padx=20, pady=(18, 4))
+
+        description = ctk.CTkLabel(
+            self.window,
+            text="These paths are optional. Leave a field blank to use the normal project or library default.",
+            text_color="#a8a8a8",
+            anchor="w",
+        )
+        description.grid(row=1, column=0, sticky="ew", padx=20, pady=(0, 14))
+
+        form = ctk.CTkFrame(self.window, corner_radius=14)
+        form.grid(row=2, column=0, sticky="nsew", padx=20, pady=(0, 14))
+        form.grid_columnconfigure(1, weight=1)
+
+        self.add_path_row(form, 0, "huggingface_cache_dir", "Hugging Face cache")
+        self.add_path_row(form, 1, "comfyui_dir", "ComfyUI directory")
+        self.add_path_row(form, 2, "output_root", "Output root")
+
+        buttons = ctk.CTkFrame(self.window, fg_color="transparent")
+        buttons.grid(row=3, column=0, sticky="e", padx=20, pady=(0, 18))
+
+        cancel = ctk.CTkButton(buttons, text="Cancel", width=100, fg_color="#444444", command=self.close)
+        cancel.grid(row=0, column=0, padx=(0, 8))
+
+        save = ctk.CTkButton(buttons, text="Save", width=100, command=self.save)
+        save.grid(row=0, column=1)
+
+    def add_path_row(self, parent, row, key, label_text):
+        label = ctk.CTkLabel(parent, text=label_text, anchor="w")
+        label.grid(row=row, column=0, sticky="w", padx=(14, 10), pady=12)
+
+        entry = ctk.CTkEntry(parent)
+        entry.grid(row=row, column=1, sticky="ew", padx=(0, 8), pady=12)
+        entry.insert(0, self.config.get("paths", {}).get(key, ""))
+        self.entries[key] = entry
+
+        button = ctk.CTkButton(parent, text="Browse", width=82, command=lambda name=key: self.browse(name))
+        button.grid(row=row, column=2, padx=(0, 14), pady=12)
+
+    def browse(self, key):
+        current = self.entries[key].get().strip()
+        initial = current if current and os.path.isdir(current) else os.path.expanduser("~")
+        selected = filedialog.askdirectory(parent=self.window, initialdir=initial)
+        if not selected:
+            return
+        self.entries[key].delete(0, "end")
+        self.entries[key].insert(0, selected)
+
+    def save(self):
+        for key, entry in self.entries.items():
+            value = entry.get().strip()
+            self.config.setdefault("paths", {})[key] = value
+        save_user_config(self.config)
+        apply_runtime_environment(self.config)
+        if self.on_saved is not None:
+            self.on_saved(self.config)
+        self.close()
+
+    def close(self):
+        self.window.grab_release()
+        self.window.destroy()
+
+
 class LauncherApp:
     def __init__(self):
         ctk.set_appearance_mode("Dark")
@@ -115,10 +206,13 @@ class LauncherApp:
         self.app.minsize(1100, 800)
 
         self.base_dir = os.path.dirname(os.path.abspath(__file__))
+        self.config = load_user_config()
+        self.hardware = detect_hardware()
+        self.launch_sessions = {}
 
         self.model_items = {}
         self.selected_model_id = None
-        self.primary_compute_gpu = 0
+        self.primary_compute_gpu = None
 
         self.preview_paths = []
         self.preview_thumbs = []
@@ -140,22 +234,36 @@ class LauncherApp:
 
         subtitle = ctk.CTkLabel(
             header,
-            text="Click a model to preview samples. Hit Launch to start it.",
+            text="Click a model to preview samples. The hardware planner chooses the loading strategy automatically.",
             text_color="#a8a8a8",
             font=ctk.CTkFont(size=13),
         )
-        subtitle.grid(row=1, column=0, sticky="w", padx=14, pady=(0, 12))
+        subtitle.grid(row=1, column=0, sticky="w", padx=14, pady=(0, 2))
+
+        self.hardware_label = ctk.CTkLabel(
+            header,
+            text=hardware_summary(self.hardware),
+            text_color="#7f9fbd",
+            font=ctk.CTkFont(size=11),
+            anchor="w",
+        )
+        self.hardware_label.grid(row=2, column=0, sticky="w", padx=14, pady=(0, 12))
 
         gpu_frame = ctk.CTkFrame(header, fg_color="transparent")
-        gpu_frame.grid(row=0, column=1, rowspan=2, sticky="e", padx=14, pady=12)
+        gpu_frame.grid(row=0, column=1, rowspan=3, sticky="e", padx=14, pady=12)
         gpu_frame.grid_columnconfigure(0, weight=1)
 
-        gpu_label = ctk.CTkLabel(gpu_frame, text="Compute GPU", text_color="#a8a8a8", font=ctk.CTkFont(size=12))
+        gpu_label = ctk.CTkLabel(gpu_frame, text="Preferred GPU", text_color="#a8a8a8", font=ctk.CTkFont(size=12))
         gpu_label.grid(row=0, column=0, sticky="e", pady=(0, 4))
 
-        self.gpu_menu = ctk.CTkOptionMenu(gpu_frame, values=["GPU 0", "GPU 1"], width=120, command=self.on_gpu_changed)
+        gpu_values = ["Automatic"]
+        gpu_values.extend([f"GPU {gpu['index']}" for gpu in self.hardware.get("gpus", [])])
+        self.gpu_menu = ctk.CTkOptionMenu(gpu_frame, values=gpu_values, width=150, command=self.on_gpu_changed)
         self.gpu_menu.grid(row=1, column=0, sticky="e")
-        self.gpu_menu.set("GPU 0")
+        self.gpu_menu.set("Automatic")
+
+        settings_button = ctk.CTkButton(gpu_frame, text="Settings", width=150, command=self.open_settings)
+        settings_button.grid(row=2, column=0, sticky="e", pady=(8, 0))
 
         left = ctk.CTkFrame(self.app, corner_radius=16)
         left.grid(row=1, column=0, sticky="nsew", padx=(14, 8), pady=(0, 10))
@@ -243,6 +351,13 @@ class LauncherApp:
         self.app.bind_all("<MouseWheel>", self.on_mousewheel)
         self.app.bind_all("<Button-4>", self.on_mousewheel)
         self.app.bind_all("<Button-5>", self.on_mousewheel)
+
+        if not os.path.isfile(config_path()):
+            known_paths = [value for value in self.config.get("paths", {}).values() if value]
+            if known_paths:
+                save_user_config(self.config)
+            else:
+                self.app.after(300, self.open_first_run_settings)
 
     def widget_inside(self, w, parent):
         if isinstance(w, str):
@@ -491,7 +606,8 @@ class LauncherApp:
         if not rel:
             return []
 
-        folder = os.path.join(self.base_dir, rel)
+        configured = resolve_output_path(rel)
+        folder = configured if os.path.isabs(configured) else os.path.join(self.base_dir, configured)
         os.makedirs(folder, exist_ok=True)
 
         exts = (".png", ".jpg", ".jpeg", ".webp", ".mp4", ".webm", ".mov", ".mkv")
@@ -621,41 +737,189 @@ class LauncherApp:
         if self.preview_list and hasattr(self.preview_list, "_parent_canvas"):
             self.preview_list._parent_canvas.yview_moveto(0)
 
+    def open_first_run_settings(self):
+        SettingsDialog(self.app, on_saved=self.on_settings_saved, first_run=True)
+
+    def open_settings(self):
+        SettingsDialog(self.app, on_saved=self.on_settings_saved, first_run=False)
+
+    def on_settings_saved(self, config):
+        self.config = config
+        self.status.configure(text="Settings saved")
+        if self.selected_model_id:
+            self.preview_paths = self.scan_preview_paths(self.selected_model_id)
+            self.render_preview_page()
+
     def on_gpu_changed(self, value):
+        if value == "Automatic":
+            self.primary_compute_gpu = None
+            return
         self.primary_compute_gpu = int(value.replace("GPU", "").strip())
 
-    def get_launch_env(self, model_id):
+    def get_launch_env(self, plan_file, attempt):
         env = os.environ.copy()
-
-        if MODEL_KIND_BY_ID.get(model_id) != "video":
-            return env
-
-        if self.primary_compute_gpu == 0:
-            env["CUDA_VISIBLE_DEVICES"] = "1,0"
-        else:
-            env["CUDA_VISIBLE_DEVICES"] = "0,1"
-
+        env["AI_WORKSTATION_PLAN_FILE"] = plan_file
+        visible = attempt.get("visible_device_order", [])
+        if visible:
+            env["CUDA_VISIBLE_DEVICES"] = ",".join(str(value) for value in visible)
         return env
 
     def on_launch(self, model_id):
         self.set_selected_model(model_id)
+        self.status.configure(text=f"Planning: {model_id}")
+        self.app.update_idletasks()
 
-        kind = MODEL_KIND_BY_ID.get(model_id)
+        result = plan_attempts(
+            model_id,
+            preferred_gpu=self.primary_compute_gpu,
+            hardware=self.hardware,
+        )
+
+        if result.get("status") != "ready":
+            reason = result.get("reason", "No supported plan is available.")
+            self.status.configure(text=f"Cannot run: {reason}")
+            messagebox.showerror("Cannot run model", reason, parent=self.app)
+            return
+
+        session_id = uuid.uuid4().hex
+        session = {
+            "session_id": session_id,
+            "model_id": model_id,
+            "kind": MODEL_KIND_BY_ID.get(model_id),
+            "attempts": result["attempts"],
+            "attempt_index": 0,
+            "process": None,
+        }
+        self.launch_sessions[session_id] = session
+        self.start_plan_attempt(session_id)
+
+    def apply_legacy_video_gpu_order(self, session, attempt):
+        if session.get("kind") != "video":
+            return attempt
+        if attempt.get("template_id") != "current_exact_fast_path":
+            return attempt
+
+        physical_ids = list(attempt.get("selected_physical_gpu_ids", []))
+        if len(physical_ids) != 2:
+            return attempt
+
+        preferred = self.primary_compute_gpu
+        if preferred is None:
+            preferred = 0
+        if preferred not in physical_ids:
+            return attempt
+
+        ordered = [gpu_id for gpu_id in physical_ids if gpu_id != preferred] + [preferred]
+        attempt["selected_physical_gpu_ids"] = ordered
+        attempt["visible_device_order"] = ordered
+        attempt["physical_to_logical_gpu"] = {gpu_id: index for index, gpu_id in enumerate(ordered)}
+        return attempt
+
+    def start_plan_attempt(self, session_id):
+        session = self.launch_sessions.get(session_id)
+        if session is None:
+            return
+
+        index = session["attempt_index"]
+        attempts = session["attempts"]
+        if index >= len(attempts):
+            self.status.configure(text=f"No working plan found for {session['model_id']}")
+            messagebox.showerror(
+                "No working plan",
+                "Every supported loading plan failed for this hardware and workload.",
+                parent=self.app,
+            )
+            self.launch_sessions.pop(session_id, None)
+            return
+
+        attempt = deepcopy(attempts[index])
+        attempt = self.apply_legacy_video_gpu_order(session, attempt)
+        plan_file = save_plan_file(attempt)
+        env = self.get_launch_env(plan_file, attempt)
+        kind = session["kind"]
 
         if kind == "chat":
             script = os.path.join(self.base_dir, "chat_gui.py")
-            subprocess.Popen([sys.executable, script, "--model-id", model_id], cwd=self.base_dir)
-            self.status.configure(text=f"Launched: {model_id}")
+            command = [sys.executable, script, "--model-id", session["model_id"], "--plan-file", plan_file]
+        else:
+            script = os.path.join(self.base_dir, "model_gui.py")
+            command = [sys.executable, script, "--model-id", session["model_id"], "--plan-file", plan_file]
+
+        self.status.configure(
+            text=f"Attempt {index + 1}/{len(attempts)}: {attempt.get('status_text', attempt.get('plan_id'))}"
+        )
+
+        process = subprocess.Popen(command, cwd=self.base_dir, env=env)
+        session["process"] = process
+        session["plan_file"] = plan_file
+        session["attempt"] = attempt
+
+        waiter = threading.Thread(target=self.wait_for_process, args=(session_id, process), daemon=True)
+        waiter.start()
+
+    def wait_for_process(self, session_id, process):
+        return_code = process.wait()
+        self.app.after(0, self.process_finished, session_id, return_code)
+
+    def process_finished(self, session_id, return_code):
+        session = self.launch_sessions.get(session_id)
+        if session is None:
             return
 
-        env = self.get_launch_env(model_id)
-        script = os.path.join(self.base_dir, "model_gui.py")
-        subprocess.Popen([sys.executable, script, "--model-id", model_id], cwd=self.base_dir, env=env)
+        attempt = session.get("attempt", {})
+        if return_code == MEMORY_RETRY_EXIT_CODE:
+            result_data = self.read_attempt_result_data(attempt)
+            retry_workload = result_data.get("workload") or attempt.get("workload")
+            replanned = plan_attempts(
+                session["model_id"],
+                workload=retry_workload,
+                preferred_gpu=self.primary_compute_gpu,
+                hardware=self.hardware,
+            )
 
-        if kind == "video":
-            self.status.configure(text=f"Launched: {model_id} on GPU {self.primary_compute_gpu}")
+            if replanned.get("status") != "ready":
+                reason = replanned.get("reason", "No safer loading plan is available.")
+                self.status.configure(text=f"Cannot run: {reason}")
+                messagebox.showerror("No working plan", reason, parent=self.app)
+                self.launch_sessions.pop(session_id, None)
+                return
+
+            session["attempts"] = replanned["attempts"]
+            session["attempt_index"] = 0
+            self.status.configure(
+                text=f"Memory limit reached in {attempt.get('plan_id', 'plan')}; replanning for the failed workload..."
+            )
+            self.app.after(250, self.start_plan_attempt, session_id)
+            return
+
+        if return_code == 0:
+            self.status.configure(text=f"Closed: {session['model_id']}")
         else:
-            self.status.configure(text=f"Launched: {model_id}")
+            details = self.read_attempt_result(attempt)
+            message = details or f"The model process exited with code {return_code}."
+            self.status.configure(text=f"Failed: {session['model_id']}")
+            messagebox.showerror("Model process failed", message, parent=self.app)
+
+        self.launch_sessions.pop(session_id, None)
+
+    def read_attempt_result_data(self, attempt):
+        result_file = attempt.get("result_file")
+        if not result_file or not os.path.isfile(result_file):
+            return {}
+        try:
+            with open(result_file, "r", encoding="utf-8") as file:
+                result = json.load(file)
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return result if isinstance(result, dict) else {}
+
+    def read_attempt_result(self, attempt):
+        result = self.read_attempt_result_data(attempt)
+        error = result.get("error", "")
+        phase = result.get("phase", "")
+        if error and phase:
+            return f"{phase}: {error}"
+        return error
 
     def run(self):
         self.app.mainloop()
