@@ -31,8 +31,6 @@ from diffusers.utils import load_image
 import cv2
 import numpy as np
 from huggingface_hub import hf_hub_download
-from basicsr.archs.rrdbnet_arch import RRDBNet
-from realesrgan import RealESRGANer
 from diffusers import StableDiffusionUpscalePipeline
 from planner_runtime import execution_device, get_active_plan, is_cuda_plan, is_exact_fast_path, load_component, load_diffusers_pipeline, plan_placement, prepare_preview_vae, torch_dtype
 
@@ -2164,6 +2162,9 @@ class RealESRGANGUI(DiffusionGUI):
             if self.upsampler is not None:
                 return
             self.model_loading = True
+
+        from basicsr.archs.rrdbnet_arch import RRDBNet
+        from realesrgan import RealESRGANer
 
         model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=4)
         weights = hf_hub_download(repo_id="lllyasviel/Annotators", filename="RealESRGAN_x4plus.pth")

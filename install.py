@@ -21,6 +21,12 @@ COMFYUI_VERSION = "v0.28.0"
 COMFYUI_ARCHIVE_URL = f"https://github.com/Comfy-Org/ComfyUI/archive/refs/tags/{COMFYUI_VERSION}.zip"
 COMFY_SCRIPT_SPEC = "comfy-script[default]"
 
+BASICSR_VERSION = "1.4.2"
+BASICSR_ARCHIVE_URL = (
+    f"https://github.com/XPixelGroup/BasicSR/archive/refs/tags/v{BASICSR_VERSION}.zip"
+)
+REALESRGAN_SPEC = "realesrgan==0.3.0"
+
 
 class InstallerApp:
     def __init__(self):
@@ -40,6 +46,8 @@ class InstallerApp:
         self.main_ready = False
         self.comfy_ready = False
         self.comfy_skipped = False
+        self.realesrgan_ready = False
+        self.realesrgan_message = "Not installed"
         self.missing_prerequisites = self.detect_external_prerequisites()
 
         self.root = tk.Tk()
@@ -235,8 +243,25 @@ class InstallerApp:
         scrollbar.grid(row=0, column=1, sticky="ns")
         self.main_log.configure(yscrollcommand=scrollbar.set)
 
-        self.main_progress = ttk.Progressbar(self.main_page, mode="indeterminate")
-        self.main_progress.grid(row=4, column=0, sticky="ew", pady=(14, 0))
+        main_progress_frame = ttk.Frame(self.main_page)
+        main_progress_frame.grid(row=4, column=0, sticky="ew", pady=(14, 0))
+        main_progress_frame.columnconfigure(0, weight=1)
+
+        self.main_progress = ttk.Progressbar(
+            main_progress_frame,
+            mode="determinate",
+            maximum=100,
+            value=0,
+        )
+        self.main_progress.grid(row=0, column=0, sticky="ew")
+
+        self.main_progress_label = ttk.Label(
+            main_progress_frame,
+            text="0%",
+            width=5,
+            anchor="e",
+        )
+        self.main_progress_label.grid(row=0, column=1, padx=(10, 0))
 
         bottom = ttk.Frame(self.main_page)
         bottom.grid(row=5, column=0, sticky="ew", pady=(12, 0))
@@ -312,8 +337,25 @@ class InstallerApp:
         scrollbar.grid(row=0, column=1, sticky="ns")
         self.comfy_log.configure(yscrollcommand=scrollbar.set)
 
-        self.comfy_progress = ttk.Progressbar(self.comfy_page, mode="indeterminate")
-        self.comfy_progress.grid(row=5, column=0, sticky="ew", pady=(14, 0))
+        comfy_progress_frame = ttk.Frame(self.comfy_page)
+        comfy_progress_frame.grid(row=5, column=0, sticky="ew", pady=(14, 0))
+        comfy_progress_frame.columnconfigure(0, weight=1)
+
+        self.comfy_progress = ttk.Progressbar(
+            comfy_progress_frame,
+            mode="determinate",
+            maximum=100,
+            value=0,
+        )
+        self.comfy_progress.grid(row=0, column=0, sticky="ew")
+
+        self.comfy_progress_label = ttk.Label(
+            comfy_progress_frame,
+            text="0%",
+            width=5,
+            anchor="e",
+        )
+        self.comfy_progress_label.grid(row=0, column=1, padx=(10, 0))
 
         bottom = ttk.Frame(self.comfy_page)
         bottom.grid(row=6, column=0, sticky="ew", pady=(12, 0))
@@ -403,6 +445,12 @@ class InstallerApp:
             return subprocess.list2cmdline(command)
         return shlex.join(command)
 
+    def queue_progress(self, target, value, status=None):
+        value = max(0.0, min(100.0, float(value)))
+        self.output_queue.put((f"{target}_progress_value", value))
+        if status:
+            self.output_queue.put((f"{target}_status", status))
+
     def requirements_files(self):
         if self.backend == "cuda":
             files = ["requirements-cuda.txt"]
@@ -456,8 +504,8 @@ class InstallerApp:
         self.show_page(self.main_page)
         self.main_action_button.configure(text="Installing...", state="disabled")
         self.main_status.configure(text="Preparing the application environment...")
-        self.main_progress.configure(mode="indeterminate")
-        self.main_progress.start(12)
+        self.main_progress.configure(value=0)
+        self.main_progress_label.configure(text="0%")
         self.active_stage = "main"
 
         thread = threading.Thread(target=self.main_install_worker, daemon=True)
@@ -468,24 +516,33 @@ class InstallerApp:
         message = "The application dependency installation failed."
 
         try:
+            self.queue_progress("main", 2, "Creating or reusing the application environment...")
             if not self.ensure_environment(self.main_venv_dir, "main"):
                 self.output_queue.put(("main_finished", False, message))
                 return
 
+            self.queue_progress("main", 8, "Application environment ready")
             main_python = self.main_python()
+
+            self.queue_progress("main", 10, "Updating pip tooling...")
             if not self.run_pip_upgrade(main_python, "main"):
                 self.output_queue.put(("main_finished", False, message))
                 return
+            self.queue_progress("main", 15, "Pip tooling ready")
 
             requirement_files = self.requirements_files()
             total = len(requirement_files)
+            requirements_start = 15.0
+            requirements_end = 76.0
+            requirements_span = requirements_end - requirements_start
 
             for index, requirement_file in enumerate(requirement_files, start=1):
-                self.output_queue.put(
-                    (
-                        "main_status",
-                        f"Installing {requirement_file} ({index} of {total})...",
-                    )
+                start_percent = requirements_start + requirements_span * (index - 1) / total
+                end_percent = requirements_start + requirements_span * index / total
+                self.queue_progress(
+                    "main",
+                    start_percent,
+                    f"Installing {requirement_file} ({index} of {total})...",
                 )
                 path = os.path.join(self.base_dir, requirement_file)
                 command = [
@@ -501,8 +558,39 @@ class InstallerApp:
                 if not self.run_command(command, "main", self.base_dir):
                     self.output_queue.put(("main_finished", False, message))
                     return
+                self.queue_progress(
+                    "main",
+                    end_percent,
+                    f"Finished {requirement_file} ({index} of {total})",
+                )
 
-            self.output_queue.put(("main_status", "Validating the application environment..."))
+            self.queue_progress(
+                "main",
+                78,
+                "Installing optional Real-ESRGAN upscaler support...",
+            )
+            self.realesrgan_ready = self.install_realesrgan_support(main_python)
+            if self.realesrgan_ready:
+                self.realesrgan_message = "Ready"
+                self.write_installation_state("realesrgan", "ready")
+                self.queue_progress("main", 92, "Real-ESRGAN support ready")
+            else:
+                self.realesrgan_message = "Unavailable"
+                self.write_installation_state("realesrgan", "unavailable")
+                self.output_queue.put(
+                    (
+                        "main_log",
+                        "\nReal-ESRGAN support could not be installed. "
+                        "The rest of the AI Workstation will remain available.\n",
+                    )
+                )
+                self.queue_progress(
+                    "main",
+                    92,
+                    "Continuing without Real-ESRGAN support...",
+                )
+
+            self.queue_progress("main", 95, "Validating the application environment...")
             verification = (
                 "import customtkinter; import torch; import transformers; import diffusers; "
                 "import accelerate; "
@@ -521,6 +609,7 @@ class InstallerApp:
 
             self.ensure_env_file()
             self.write_installation_state("main", "ready")
+            self.queue_progress("main", 100, "Application installation complete")
             success = True
             message = "The main AI Workstation environment is ready."
         except Exception as error:
@@ -528,6 +617,242 @@ class InstallerApp:
             message = str(error)
 
         self.output_queue.put(("main_finished", success, message))
+
+    def install_realesrgan_support(self, python_path):
+        verification = (
+            "from basicsr.archs.rrdbnet_arch import RRDBNet; "
+            "from realesrgan import RealESRGANer; "
+            "print('Real-ESRGAN validation passed')"
+        )
+        if self.command_succeeds([python_path, "-c", verification], self.base_dir):
+            self.output_queue.put(
+                ("main_log", "Existing Real-ESRGAN installation passed validation.\n")
+            )
+            return True
+
+        os.makedirs(self.runtime_dir, exist_ok=True)
+        working_dir = tempfile.mkdtemp(
+            prefix="basicsr_install_",
+            dir=self.runtime_dir,
+        )
+        archive_path = os.path.join(working_dir, f"BasicSR-{BASICSR_VERSION}.zip")
+        extract_dir = os.path.join(working_dir, "source")
+
+        try:
+            self.queue_progress(
+                "main",
+                79,
+                f"Downloading BasicSR {BASICSR_VERSION} source...",
+            )
+            if not self.download_archive(
+                BASICSR_ARCHIVE_URL,
+                archive_path,
+                "main",
+                79,
+                83,
+                f"Downloading BasicSR {BASICSR_VERSION}",
+            ):
+                return False
+
+            self.queue_progress("main", 84, "Preparing BasicSR source...")
+            os.makedirs(extract_dir, exist_ok=True)
+            with zipfile.ZipFile(archive_path, "r") as archive:
+                archive.extractall(extract_dir)
+
+            source_dir = self.find_python_source(
+                extract_dir,
+                required_files=["setup.py", "VERSION"],
+            )
+            if not source_dir:
+                self.output_queue.put(
+                    ("main_log", "BasicSR archive did not contain the expected source files.\n")
+                )
+                return False
+
+            if not self.patch_basicsr_source(source_dir):
+                return False
+
+            self.queue_progress("main", 85, "Installing the patched official BasicSR release...")
+            basicsr_command = [
+                python_path,
+                "-m",
+                "pip",
+                "install",
+                "--no-build-isolation",
+                "--progress-bar",
+                "on",
+                source_dir,
+            ]
+            if not self.run_command(basicsr_command, "main", self.base_dir):
+                return False
+
+            self.queue_progress("main", 89, "Installing Real-ESRGAN...")
+            realesrgan_command = [
+                python_path,
+                "-m",
+                "pip",
+                "install",
+                "--no-deps",
+                "--progress-bar",
+                "on",
+                REALESRGAN_SPEC,
+            ]
+            if not self.run_command(realesrgan_command, "main", self.base_dir):
+                return False
+
+            self.queue_progress("main", 91, "Validating Real-ESRGAN...")
+            if not self.run_command(
+                [python_path, "-c", verification],
+                "main",
+                self.base_dir,
+            ):
+                return False
+            return True
+        finally:
+            shutil.rmtree(working_dir, ignore_errors=True)
+
+    def patch_basicsr_source(self, source_dir):
+        setup_path = os.path.join(source_dir, "setup.py")
+        degradation_path = os.path.join(
+            source_dir,
+            "basicsr",
+            "data",
+            "degradations.py",
+        )
+
+        with open(setup_path, "r", encoding="utf-8") as file:
+            setup_text = file.read()
+
+        old_version_code = """def get_version():
+    with open(version_file, 'r') as f:
+        exec(compile(f.read(), version_file, 'exec'))
+    return locals()['__version__']
+"""
+        new_version_code = """def get_version():
+    namespace = {}
+    with open(version_file, 'r') as f:
+        exec(compile(f.read(), version_file, 'exec'), namespace)
+    return namespace['__version__']
+"""
+
+        if old_version_code in setup_text:
+            setup_text = setup_text.replace(old_version_code, new_version_code)
+            with open(setup_path, "w", encoding="utf-8") as file:
+                file.write(setup_text)
+            self.output_queue.put(
+                (
+                    "main_log",
+                    "Applied the Python 3.13+ BasicSR version-reader compatibility patch.\n",
+                )
+            )
+        elif new_version_code not in setup_text:
+            self.output_queue.put(
+                (
+                    "main_log",
+                    "BasicSR setup.py did not match the pinned source layout.\n",
+                )
+            )
+            return False
+
+        if not os.path.isfile(degradation_path):
+            self.output_queue.put(
+                ("main_log", "BasicSR degradation module was not found.\n")
+            )
+            return False
+
+        with open(degradation_path, "r", encoding="utf-8") as file:
+            degradation_text = file.read()
+
+        old_import = (
+            "from torchvision.transforms.functional_tensor import rgb_to_grayscale"
+        )
+        new_import = "from torchvision.transforms.functional import rgb_to_grayscale"
+
+        if old_import in degradation_text:
+            degradation_text = degradation_text.replace(old_import, new_import)
+            with open(degradation_path, "w", encoding="utf-8") as file:
+                file.write(degradation_text)
+            self.output_queue.put(
+                (
+                    "main_log",
+                    "Applied the current torchvision compatibility patch to BasicSR.\n",
+                )
+            )
+        elif new_import not in degradation_text:
+            self.output_queue.put(
+                (
+                    "main_log",
+                    "BasicSR torchvision import did not match the pinned source layout.\n",
+                )
+            )
+            return False
+
+        return True
+
+    def find_python_source(self, extract_dir, required_files):
+        for root, directories, files in os.walk(extract_dir):
+            directory_names = set(directories)
+            file_names = set(files)
+            required_names = set(required_files)
+            if required_names.issubset(file_names):
+                return root
+            if ".git" in directory_names:
+                directories.remove(".git")
+        return None
+
+    def download_archive(
+        self,
+        url,
+        destination,
+        target,
+        start_percent,
+        end_percent,
+        status_prefix,
+    ):
+        try:
+            request = urllib.request.Request(
+                url,
+                headers={"User-Agent": "AI-Workstation-Installer/1.0"},
+            )
+            with urllib.request.urlopen(request, timeout=60) as response:
+                total = int(response.headers.get("Content-Length", "0") or "0")
+                received = 0
+                with open(destination, "wb") as file:
+                    while True:
+                        chunk = response.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        file.write(chunk)
+                        received += len(chunk)
+                        if total:
+                            fraction = min(1.0, received / total)
+                            percent = start_percent + (
+                                end_percent - start_percent
+                            ) * fraction
+                            self.queue_progress(
+                                target,
+                                percent,
+                                f"{status_prefix}: {fraction * 100:.0f}%",
+                            )
+            self.queue_progress(target, end_percent, f"{status_prefix}: complete")
+            return True
+        except Exception as error:
+            self.output_queue.put(
+                (f"{target}_log", f"Download failed: {error}\n")
+            )
+            return False
+
+    def command_succeeds(self, command, cwd=None):
+        environment = os.environ.copy()
+        environment["PYTHONUNBUFFERED"] = "1"
+        result = subprocess.run(
+            command,
+            cwd=cwd or self.base_dir,
+            env=environment,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return result.returncode == 0
 
     def ensure_environment(self, environment_dir, target):
         python_path = self.environment_python(environment_dir)
@@ -629,8 +954,8 @@ class InstallerApp:
         self.comfy_action_button.configure(text="Installing...", state="disabled")
         self.skip_comfy_button.configure(state="disabled")
         self.comfy_status.configure(text="Preparing the ComfyUI backend...")
-        self.comfy_progress.configure(mode="indeterminate", value=0)
-        self.comfy_progress.start(12)
+        self.comfy_progress.configure(value=0)
+        self.comfy_progress_label.configure(text="0%")
         self.active_stage = "comfy"
 
         thread = threading.Thread(target=self.comfy_install_worker, daemon=True)
@@ -641,21 +966,28 @@ class InstallerApp:
         message = "The optional ComfyUI backend could not be installed."
 
         try:
+            self.queue_progress("comfy", 2, "Preparing the ComfyUI source...")
             if not self.ensure_comfyui_source():
                 self.output_queue.put(("comfy_finished", False, message))
                 return
+            self.queue_progress("comfy", 22, "ComfyUI source ready")
 
             if not self.ensure_environment(self.comfy_venv_dir, "comfy"):
                 self.output_queue.put(("comfy_finished", False, message))
                 return
+            self.queue_progress("comfy", 28, "ComfyUI environment ready")
 
             comfy_python = self.comfy_python()
+            self.queue_progress("comfy", 30, "Updating ComfyUI pip tooling...")
             if not self.run_pip_upgrade(comfy_python, "comfy"):
                 self.output_queue.put(("comfy_finished", False, message))
                 return
+            self.queue_progress("comfy", 36, "ComfyUI pip tooling ready")
 
-            self.output_queue.put(
-                ("comfy_status", "Installing the ComfyUI hardware backend...")
+            self.queue_progress(
+                "comfy",
+                38,
+                "Installing the ComfyUI hardware backend...",
             )
             backend_path = os.path.join(self.base_dir, self.backend_requirements_file())
             backend_command = [
@@ -671,8 +1003,9 @@ class InstallerApp:
             if not self.run_command(backend_command, "comfy", self.base_dir):
                 self.output_queue.put(("comfy_finished", False, message))
                 return
+            self.queue_progress("comfy", 55, "ComfyUI hardware backend ready")
 
-            self.output_queue.put(("comfy_status", "Installing ComfyUI dependencies..."))
+            self.queue_progress("comfy", 57, "Installing ComfyUI dependencies...")
             comfy_requirements = os.path.join(self.comfyui_dir, "requirements.txt")
             comfy_command = [
                 comfy_python,
@@ -687,8 +1020,9 @@ class InstallerApp:
             if not self.run_command(comfy_command, "comfy", self.comfyui_dir):
                 self.output_queue.put(("comfy_finished", False, message))
                 return
+            self.queue_progress("comfy", 76, "ComfyUI dependencies ready")
 
-            self.output_queue.put(("comfy_status", "Installing ComfyScript support..."))
+            self.queue_progress("comfy", 78, "Installing ComfyScript support...")
             comfy_script_command = [
                 comfy_python,
                 "-m",
@@ -702,6 +1036,7 @@ class InstallerApp:
             if not self.run_command(comfy_script_command, "comfy", self.comfyui_dir):
                 self.output_queue.put(("comfy_finished", False, message))
                 return
+            self.queue_progress("comfy", 86, "ComfyScript backend support ready")
 
             main_comfy_script_command = [
                 self.main_python(),
@@ -716,8 +1051,9 @@ class InstallerApp:
             if not self.run_command(main_comfy_script_command, "comfy", self.base_dir):
                 self.output_queue.put(("comfy_finished", False, message))
                 return
+            self.queue_progress("comfy", 91, "ComfyScript application support ready")
 
-            self.output_queue.put(("comfy_status", "Validating ComfyScript..."))
+            self.queue_progress("comfy", 93, "Validating ComfyScript...")
             verification = (
                 "import nest_asyncio2; from comfy_script.runtime import Workflow, util; "
                 "print('ComfyScript validation passed')"
@@ -739,8 +1075,9 @@ class InstallerApp:
                 message = "ComfyScript installed but did not pass its application import validation."
                 self.output_queue.put(("comfy_finished", False, message))
                 return
+            self.queue_progress("comfy", 97, "ComfyScript validation passed")
 
-            self.output_queue.put(("comfy_status", "Running the ComfyUI startup check..."))
+            self.queue_progress("comfy", 98, "Running the ComfyUI startup check...")
             quick_test = [
                 comfy_python,
                 os.path.join(self.comfyui_dir, "main.py"),
@@ -754,6 +1091,7 @@ class InstallerApp:
 
             self.save_managed_comfyui_path()
             self.write_installation_state("comfyui", "ready")
+            self.queue_progress("comfy", 100, "ComfyUI installation complete")
             success = True
             message = "The optional ComfyUI backend is ready."
         except Exception as error:
@@ -783,14 +1121,22 @@ class InstallerApp:
         if os.path.isfile(archive_path):
             os.remove(archive_path)
 
-        self.output_queue.put(
-            ("comfy_status", f"Downloading ComfyUI {COMFYUI_VERSION}...")
+        self.queue_progress(
+            "comfy",
+            2,
+            f"Downloading ComfyUI {COMFYUI_VERSION}...",
         )
-        if not self.download_file(COMFYUI_ARCHIVE_URL, archive_path):
+        if not self.download_archive(
+            COMFYUI_ARCHIVE_URL,
+            archive_path,
+            "comfy",
+            2,
+            18,
+            f"Downloading ComfyUI {COMFYUI_VERSION}",
+        ):
             return False
 
-        self.output_queue.put(("comfy_status", "Extracting ComfyUI..."))
-        self.output_queue.put(("comfy_progress_mode", "indeterminate"))
+        self.queue_progress("comfy", 19, "Extracting ComfyUI...")
         os.makedirs(extract_dir, exist_ok=True)
 
         with zipfile.ZipFile(archive_path, "r") as archive:
@@ -827,38 +1173,6 @@ class InstallerApp:
             ):
                 return candidate
         return None
-
-    def download_file(self, url, destination):
-        try:
-            request = urllib.request.Request(
-                url,
-                headers={"User-Agent": "AI-Workstation-Installer/1.0"},
-            )
-            with urllib.request.urlopen(request, timeout=60) as response:
-                total = int(response.headers.get("Content-Length", "0") or "0")
-                received = 0
-                self.output_queue.put(("comfy_progress_mode", "determinate" if total else "indeterminate"))
-
-                with open(destination, "wb") as file:
-                    while True:
-                        chunk = response.read(1024 * 1024)
-                        if not chunk:
-                            break
-                        file.write(chunk)
-                        received += len(chunk)
-                        if total:
-                            percent = min(100.0, received * 100.0 / total)
-                            self.output_queue.put(("comfy_progress_value", percent))
-                            self.output_queue.put(
-                                (
-                                    "comfy_status",
-                                    f"Downloading ComfyUI {COMFYUI_VERSION}: {percent:.0f}%",
-                                )
-                            )
-            return True
-        except Exception as error:
-            self.output_queue.put(("comfy_log", f"ComfyUI download failed: {error}\n"))
-            return False
 
     def save_managed_comfyui_path(self):
         config = {}
@@ -941,6 +1255,7 @@ class InstallerApp:
         launch_command = self.command_text([self.main_python(), "gui.py"])
         summary = (
             f"Main application environment: {main_text}\n"
+            f"Real-ESRGAN upscaler: {self.realesrgan_message}\n"
             f"ComfyUI backend: {comfy_text}\n"
             f"External system software: {prerequisites}\n\n"
             f"Main environment: {self.main_venv_dir}\n"
@@ -1006,9 +1321,10 @@ class InstallerApp:
 
     def handle_main_finished(self, success, message):
         self.active_stage = None
-        self.main_progress.stop()
 
         if success:
+            self.main_progress.configure(value=100)
+            self.main_progress_label.configure(text="100%")
             self.main_ready = True
             self.main_status.configure(text="Main application installation complete")
             self.append_text(self.main_log, f"\n{message}\n")
@@ -1034,10 +1350,10 @@ class InstallerApp:
 
     def handle_comfy_finished(self, success, message):
         self.active_stage = None
-        self.comfy_progress.stop()
-        self.comfy_progress.configure(mode="indeterminate", value=0)
 
         if success:
+            self.comfy_progress.configure(value=100)
+            self.comfy_progress_label.configure(text="100%")
             self.comfy_ready = True
             self.comfy_skipped = False
             self.comfy_status.configure(text="ComfyUI installation complete")
@@ -1090,13 +1406,14 @@ class InstallerApp:
                 self.comfy_status.configure(text=event[1])
             elif event_type == "comfy_finished":
                 self.handle_comfy_finished(event[1], event[2])
-            elif event_type == "comfy_progress_mode":
-                self.comfy_progress.stop()
-                self.comfy_progress.configure(mode=event[1], value=0)
-                if event[1] == "indeterminate":
-                    self.comfy_progress.start(12)
+            elif event_type == "main_progress_value":
+                value = float(event[1])
+                self.main_progress.configure(value=value)
+                self.main_progress_label.configure(text=f"{value:.0f}%")
             elif event_type == "comfy_progress_value":
-                self.comfy_progress.configure(value=event[1])
+                value = float(event[1])
+                self.comfy_progress.configure(value=value)
+                self.comfy_progress_label.configure(text=f"{value:.0f}%")
 
         self.root.after(100, self.poll_output)
 

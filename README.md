@@ -46,8 +46,13 @@ The installation is split into clear pages:
 
 1. Detect the operating system and CUDA, MPS, or CPU backend.
 2. Create or update `.venv` and install the main requirements.
-3. Optionally download and install the pinned ComfyUI backend into `runtime/ComfyUI` using `.comfy_venv`.
-4. Show a completion page with **Launch AI Workstation** and **Close**.
+3. Install the optional Real-ESRGAN utility from the official pinned BasicSR and Real-ESRGAN releases.
+4. Optionally download and install the pinned ComfyUI backend into `runtime/ComfyUI` using `.comfy_venv`.
+5. Show a completion page with **Launch AI Workstation** and **Close**.
+
+The progress bars show overall milestone completion as a percentage. Pip does not expose one reliable byte-level percentage for a complete dependency transaction, so the percentage advances when each verified installation stage completes and never moves backwards.
+
+If Real-ESRGAN support cannot be installed, the main application continues without that one optional upscaler. Its legacy BasicSR dependency is installed separately so it cannot prevent unrelated models from working.
 
 If ComfyUI installation fails, choose **Retry ComfyUI** or **Continue Without ComfyUI**. The failure does not prevent other image, video, utility, or chat models from being used.
 
@@ -179,7 +184,7 @@ Those model weights are not included in the project archive.
 
 ## Requirements files
 
-- `requirements.txt` — shared application and model-library dependencies
+- `requirements.txt` — shared application and model-library dependencies; legacy Real-ESRGAN packages are installed separately by `install.py`
 - `requirements-cuda.txt` — PyTorch, BitsAndBytes, and NVML support
 - `requirements-cpu.txt` — CPU PyTorch packages and the CPU-capable BitsAndBytes runtime
 - `requirements-macos.txt` — macOS/MPS PyTorch packages

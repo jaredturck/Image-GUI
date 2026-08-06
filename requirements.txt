@@ -14,8 +14,6 @@ sentencepiece
 protobuf
 psutil
 sounddevice
-basicsr
-realesrgan
 scipy
 einops
 timm
