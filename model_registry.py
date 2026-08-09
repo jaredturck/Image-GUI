@@ -374,6 +374,8 @@ LAUNCHER_MODEL_IDS = [
     'tiiuae/Falcon-H1-34B-Instruct',
     'LiquidAI/LFM2.5-1.2B-Thinking',
     'microsoft/Phi-4-reasoning',
+    'Qwen/Qwen3.5-4B',
+    'Qwen/Qwen3.5-9B',
     'Qwen/Qwen3-14B',
     'openai/gpt-oss-20b',
     'deepseek-ai/DeepSeek-R1-Distill-Qwen-32B',
@@ -2255,6 +2257,276 @@ RAW_MODEL_PROFILES = [
             'quantization_quality': 'policy_and_research_inference'
         },
         'notes': [],
+        'application_source_files': ['chat_gui.py']
+    },
+    {
+        'key': 'qwen3_5_4b',
+        'model_id': 'Qwen/Qwen3.5-4B',
+        'runtime_model_id': 'Qwen/Qwen3.5-4B',
+        'launcher_id': 'Qwen/Qwen3.5-4B',
+        'display_name': 'Qwen3.5 4B',
+        'category': 'multimodal_llm',
+        'task': 'multimodal_reasoning',
+        'checkpoint': {'format': 'safetensors', 'native_dtype': 'bfloat16', 'already_quantized': False},
+        'architecture': {
+            'family': 'qwen3_5_hybrid_linear_full_attention_multimodal',
+            'parameter_billions': 4.0,
+            'active_parameter_billions': 4.0,
+            'hidden_size': 2560,
+            'intermediate_size': 9216,
+            'num_hidden_layers': 32,
+            'num_attention_heads': 16,
+            'num_key_value_heads': 4,
+            'head_dim': 256,
+            'max_context_tokens': 262144,
+            'vocab_size': 248320,
+            'uses_kv_cache': True,
+            'cache_dtype': 'bfloat16'
+        },
+        'components': {
+            'language_model': {
+                'role': 'llm_decoder',
+                'architecture': 'qwen3_5_hybrid_linear_full_attention_multimodal',
+                'parameter_billions': 4.0,
+                'active_parameter_billions': 4.0,
+                'native_dtype': 'bfloat16',
+                'quantizable_fraction': 0.93,
+                'checkpoint_storage_gib': 0.0,
+                'checkpoint_storage_basis': 'repository_file_inventory',
+                'phases': ['prefill', 'decode'],
+                'sharding': 'decoder_block_sharding_and_automatic_device_map',
+                'offload': 'device_map_cpu_overflow_or_cpu_execution',
+                'quantization_support': {'int8': 'supported_with_bitsandbytes', 'int4': 'supported_with_bitsandbytes'},
+                'skip_modules': ['model.embed_tokens', 'lm_head', 'normalization_layers'],
+                'memory_overrides_gib': {},
+                'confidence': 'high',
+                'evidence': 'official_qwen_model_overview_and_configuration',
+                'notes': []
+            },
+            'vision_encoder': {
+                'role': 'vision_encoder',
+                'architecture': 'qwen3_5_vision_transformer',
+                'parameter_billions': 0.66,
+                'active_parameter_billions': 0.66,
+                'native_dtype': 'bfloat16',
+                'quantizable_fraction': 0.75,
+                'checkpoint_storage_gib': 0.0,
+                'checkpoint_storage_basis': 'repository_file_inventory',
+                'phases': ['vision_encoding'],
+                'sharding': 'whole_component',
+                'offload': 'component_offload',
+                'quantization_support': {'int8': 'supported_with_bitsandbytes', 'int4': 'supported_with_bitsandbytes'},
+                'skip_modules': [],
+                'memory_overrides_gib': {},
+                'confidence': 'estimated_from_official_checkpoint_and_configuration',
+                'evidence': 'official_checkpoint_total_size_minus_published_language_model_parameter_count',
+                'notes': ['24 layers, hidden size 1024, 16 attention heads, patch size 16.']
+            }
+        },
+        'execution_phases': [
+            {
+                'name': 'prefill',
+                'required_components': ['language_model', 'vision_encoder'],
+                'dynamic_memory_scales_with': ['batch_size', 'padded_prompt_tokens', 'attention_backend']
+            },
+            {
+                'name': 'decode',
+                'required_components': ['language_model'],
+                'dynamic_memory_scales_with': ['batch_size', 'cached_tokens', 'generated_tokens']
+            }
+        ],
+        'default_workload': {'batch_size': 1, 'prompt_tokens': 4096, 'max_new_tokens': 4096},
+        'runtime_memory': {
+            'dominant_terms': [
+                'weights',
+                'hybrid_attention_state',
+                'kv_cache',
+                'prefill_mlp_activations',
+                'quantization_temporaries'
+            ],
+            'kv_cache_formula_bytes': '2 * batch * cached_tokens * full_attention_layers * kv_heads * head_dim * cache_dtype_bytes',
+            'prefill_risk': 'medium',
+            'decode_risk': 'low_to_medium',
+            'default_runtime_headroom_gib': 1.0
+        },
+        'backend_support': {
+            'cuda': 'supported',
+            'mps': 'supported_with_transformers_operator_and_memory_limits',
+            'cpu': 'supported',
+            'cpu_practicality': 'usable',
+            'bitsandbytes_cuda': True,
+            'vllm': False
+        },
+        'placement_support': {
+            'single_gpu': True,
+            'multi_gpu_device_map': True,
+            'decoder_block_sharding': True,
+            'cpu_overflow_device_map': True,
+            'cpu_only': True,
+            'sequential_cpu_offload': False
+        },
+        'quantization_policy': {
+            'int8_auto_allowed': True,
+            'int8_quality_risk': 'low',
+            'int4_auto_allowed': True,
+            'int4_quality_risk': 'medium',
+            'int4_priority': 'only_after_int8_and_native_offload_fail',
+            'minimum_automatic_bits': 4,
+            'reasoning_or_precision_sensitive': True,
+            'keep_high_precision': ['embeddings', 'normalization', 'lm_head']
+        },
+        'current_code': {
+            'loader': 'transformers_pipeline',
+            'quantization': '8bit',
+            'plan': 'planner_selected_cuda_or_mps'
+        },
+        'sources': [
+            'https://huggingface.co/Qwen/Qwen3.5-4B',
+            'https://huggingface.co/Qwen/Qwen3.5-4B/blob/main/config.json',
+            'https://huggingface.co/Qwen/Qwen3.5-4B/blob/main/model.safetensors.index.json'
+        ],
+        'confidence': {
+            'architecture': 'high',
+            'weight_memory': 'high',
+            'runtime_peak': 'estimated',
+            'quantization_quality': 'policy_and_research_inference'
+        },
+        'notes': ['Chat GUI uses the Qwen3.5 processor path with thinking enabled by default.'],
+        'application_source_files': ['chat_gui.py']
+    },
+    {
+        'key': 'qwen3_5_9b',
+        'model_id': 'Qwen/Qwen3.5-9B',
+        'runtime_model_id': 'Qwen/Qwen3.5-9B',
+        'launcher_id': 'Qwen/Qwen3.5-9B',
+        'display_name': 'Qwen3.5 9B',
+        'category': 'multimodal_llm',
+        'task': 'multimodal_reasoning',
+        'checkpoint': {'format': 'safetensors', 'native_dtype': 'bfloat16', 'already_quantized': False},
+        'architecture': {
+            'family': 'qwen3_5_hybrid_linear_full_attention_multimodal',
+            'parameter_billions': 9.0,
+            'active_parameter_billions': 9.0,
+            'hidden_size': 4096,
+            'intermediate_size': 12288,
+            'num_hidden_layers': 32,
+            'num_attention_heads': 16,
+            'num_key_value_heads': 4,
+            'head_dim': 256,
+            'max_context_tokens': 262144,
+            'vocab_size': 248320,
+            'uses_kv_cache': True,
+            'cache_dtype': 'bfloat16'
+        },
+        'components': {
+            'language_model': {
+                'role': 'llm_decoder',
+                'architecture': 'qwen3_5_hybrid_linear_full_attention_multimodal',
+                'parameter_billions': 9.0,
+                'active_parameter_billions': 9.0,
+                'native_dtype': 'bfloat16',
+                'quantizable_fraction': 0.93,
+                'checkpoint_storage_gib': 0.0,
+                'checkpoint_storage_basis': 'repository_file_inventory',
+                'phases': ['prefill', 'decode'],
+                'sharding': 'decoder_block_sharding_and_automatic_device_map',
+                'offload': 'device_map_cpu_overflow_or_cpu_execution',
+                'quantization_support': {'int8': 'supported_with_bitsandbytes', 'int4': 'supported_with_bitsandbytes'},
+                'skip_modules': ['model.embed_tokens', 'lm_head', 'normalization_layers'],
+                'memory_overrides_gib': {},
+                'confidence': 'high',
+                'evidence': 'official_qwen_model_overview_and_configuration',
+                'notes': []
+            },
+            'vision_encoder': {
+                'role': 'vision_encoder',
+                'architecture': 'qwen3_5_vision_transformer',
+                'parameter_billions': 0.65,
+                'active_parameter_billions': 0.65,
+                'native_dtype': 'bfloat16',
+                'quantizable_fraction': 0.75,
+                'checkpoint_storage_gib': 0.0,
+                'checkpoint_storage_basis': 'repository_file_inventory',
+                'phases': ['vision_encoding'],
+                'sharding': 'whole_component',
+                'offload': 'component_offload',
+                'quantization_support': {'int8': 'supported_with_bitsandbytes', 'int4': 'supported_with_bitsandbytes'},
+                'skip_modules': [],
+                'memory_overrides_gib': {},
+                'confidence': 'estimated_from_official_checkpoint_and_configuration',
+                'evidence': 'official_checkpoint_total_size_minus_published_language_model_parameter_count',
+                'notes': ['24 layers, hidden size 1024, 16 attention heads, patch size 16.']
+            }
+        },
+        'execution_phases': [
+            {
+                'name': 'prefill',
+                'required_components': ['language_model', 'vision_encoder'],
+                'dynamic_memory_scales_with': ['batch_size', 'padded_prompt_tokens', 'attention_backend']
+            },
+            {
+                'name': 'decode',
+                'required_components': ['language_model'],
+                'dynamic_memory_scales_with': ['batch_size', 'cached_tokens', 'generated_tokens']
+            }
+        ],
+        'default_workload': {'batch_size': 1, 'prompt_tokens': 4096, 'max_new_tokens': 4096},
+        'runtime_memory': {
+            'dominant_terms': [
+                'weights',
+                'hybrid_attention_state',
+                'kv_cache',
+                'prefill_mlp_activations',
+                'quantization_temporaries'
+            ],
+            'kv_cache_formula_bytes': '2 * batch * cached_tokens * full_attention_layers * kv_heads * head_dim * cache_dtype_bytes',
+            'prefill_risk': 'medium',
+            'decode_risk': 'low_to_medium',
+            'default_runtime_headroom_gib': 1.0
+        },
+        'backend_support': {
+            'cuda': 'supported',
+            'mps': 'supported_with_transformers_operator_and_memory_limits',
+            'cpu': 'supported',
+            'cpu_practicality': 'usable',
+            'bitsandbytes_cuda': True,
+            'vllm': False
+        },
+        'placement_support': {
+            'single_gpu': True,
+            'multi_gpu_device_map': True,
+            'decoder_block_sharding': True,
+            'cpu_overflow_device_map': True,
+            'cpu_only': True,
+            'sequential_cpu_offload': False
+        },
+        'quantization_policy': {
+            'int8_auto_allowed': True,
+            'int8_quality_risk': 'low',
+            'int4_auto_allowed': True,
+            'int4_quality_risk': 'medium',
+            'int4_priority': 'only_after_int8_and_native_offload_fail',
+            'minimum_automatic_bits': 4,
+            'reasoning_or_precision_sensitive': True,
+            'keep_high_precision': ['embeddings', 'normalization', 'lm_head']
+        },
+        'current_code': {
+            'loader': 'transformers_pipeline',
+            'quantization': '4bit',
+            'plan': 'planner_selected_cuda_or_mps'
+        },
+        'sources': [
+            'https://huggingface.co/Qwen/Qwen3.5-9B',
+            'https://huggingface.co/Qwen/Qwen3.5-9B/blob/main/config.json',
+            'https://huggingface.co/Qwen/Qwen3.5-9B/blob/main/model.safetensors.index.json'
+        ],
+        'confidence': {
+            'architecture': 'high',
+            'weight_memory': 'high',
+            'runtime_peak': 'estimated',
+            'quantization_quality': 'policy_and_research_inference'
+        },
+        'notes': ['Chat GUI uses the Qwen3.5 processor path with thinking enabled by default.'],
         'application_source_files': ['chat_gui.py']
     },
     {

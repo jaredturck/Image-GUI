@@ -46,6 +46,8 @@ CHAT_MODEL_QUANTIZATION = {
     GEMMA_4_MODEL_ID: "8bit",
     "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B": "8bit",
     "Qwen/Qwen2.5-32B-Instruct": "8bit",
+    "Qwen/Qwen3.5-4B": "8bit",
+    "Qwen/Qwen3.5-9B": "4bit",
     "tiiuae/Falcon-H1-34B-Instruct": "8bit",
     "Qwen/Qwen3.6-27B": "4bit",
 }
@@ -77,6 +79,8 @@ VLLM_MODEL_CONFIGS = {
 }
 
 PROCESSOR_CHAT_MODEL_IDS = {
+    "Qwen/Qwen3.5-4B",
+    "Qwen/Qwen3.5-9B",
     "Qwen/Qwen3.6-27B",
     GEMMA_4_MODEL_ID,
 }
@@ -84,6 +88,8 @@ PROCESSOR_CHAT_MODEL_IDS = {
 REASONING_MODEL_IDS = {
     "LiquidAI/LFM2.5-1.2B-Thinking",
     "microsoft/Phi-4-reasoning",
+    "Qwen/Qwen3.5-4B",
+    "Qwen/Qwen3.5-9B",
     "Qwen/Qwen3-14B",
     "openai/gpt-oss-20b",
     "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B",
@@ -2050,7 +2056,7 @@ class ChatGUI:
                 text=prompt,
                 return_tensors="pt",
             )
-        elif self.model_id == "Qwen/Qwen3.6-27B":
+        elif self.model_id in ("Qwen/Qwen3.5-4B", "Qwen/Qwen3.5-9B", "Qwen/Qwen3.6-27B"):
             template_processor = processor if processor is not None else tokenizer
             inputs = template_processor.apply_chat_template(
                 messages,

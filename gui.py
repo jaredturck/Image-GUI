@@ -60,6 +60,8 @@ MODELS = [
     ('Falcon-H1 34B Instruct', 'tiiuae/Falcon-H1-34B-Instruct', 'chat', '34B'),
     ('Liquid LFM2.5 1.2B Thinking', 'LiquidAI/LFM2.5-1.2B-Thinking', 'chat', '1.2B'),
     ('Phi-4 14B (Math)', 'microsoft/Phi-4-reasoning', 'chat', '14B'),
+    ('Qwen3.5 4B', 'Qwen/Qwen3.5-4B', 'chat', '4B'),
+    ('Qwen3.5 9B', 'Qwen/Qwen3.5-9B', 'chat', '9B'),
     ('Qwen3 14B', 'Qwen/Qwen3-14B', 'chat', '14B'),
     ('GPT-OSS 20B', 'openai/gpt-oss-20b', 'chat', '20B-3.6A'),
     ('DeepSeek R1 Distill Qwen 32B', 'deepseek-ai/DeepSeek-R1-Distill-Qwen-32B', 'chat', '32B'),
@@ -74,6 +76,8 @@ MODEL_KIND_BY_ID = {model_id: model_kind for _, model_id, model_kind, _ in MODEL
 REASONING_CHAT_MODEL_IDS = {
     "LiquidAI/LFM2.5-1.2B-Thinking",
     "microsoft/Phi-4-reasoning",
+    "Qwen/Qwen3.5-4B",
+    "Qwen/Qwen3.5-9B",
     "Qwen/Qwen3-14B",
     "openai/gpt-oss-20b",
     "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B",
