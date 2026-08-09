@@ -9,7 +9,7 @@ from PIL import Image
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from tkinter import filedialog, messagebox
 
-from app_config import apply_runtime_environment, config_path, load_user_config, resolve_output_path, save_user_config
+from app_config import apply_runtime_environment, load_user_config, resolve_output_path, save_user_config
 from hardware_detection import detect_hardware, hardware_summary
 from hardware_planner import plan_attempts, save_plan_file
 from planner_protocol import MEMORY_RETRY_EXIT_CODE
@@ -116,7 +116,7 @@ MODEL_PREVIEW_DIRS = {
 
 
 class SettingsDialog:
-    def __init__(self, parent, on_saved=None, first_run=False):
+    def __init__(self, parent, on_saved=None):
         self.parent = parent
         self.on_saved = on_saved
         self.config = load_user_config()
@@ -130,7 +130,7 @@ class SettingsDialog:
         self.window.grab_set()
         self.window.grid_columnconfigure(0, weight=1)
 
-        title_text = "First-run setup" if first_run else "Application paths"
+        title_text = "Application paths"
         title = ctk.CTkLabel(self.window, text=title_text, font=ctk.CTkFont(size=21, weight="bold"))
         title.grid(row=0, column=0, sticky="w", padx=20, pady=(18, 4))
 
@@ -351,13 +351,6 @@ class LauncherApp:
         self.app.bind_all("<MouseWheel>", self.on_mousewheel)
         self.app.bind_all("<Button-4>", self.on_mousewheel)
         self.app.bind_all("<Button-5>", self.on_mousewheel)
-
-        if not os.path.isfile(config_path()):
-            known_paths = [value for value in self.config.get("paths", {}).values() if value]
-            if known_paths:
-                save_user_config(self.config)
-            else:
-                self.app.after(300, self.open_first_run_settings)
 
     def widget_inside(self, w, parent):
         if isinstance(w, str):
@@ -737,11 +730,8 @@ class LauncherApp:
         if self.preview_list and hasattr(self.preview_list, "_parent_canvas"):
             self.preview_list._parent_canvas.yview_moveto(0)
 
-    def open_first_run_settings(self):
-        SettingsDialog(self.app, on_saved=self.on_settings_saved, first_run=True)
-
     def open_settings(self):
-        SettingsDialog(self.app, on_saved=self.on_settings_saved, first_run=False)
+        SettingsDialog(self.app, on_saved=self.on_settings_saved)
 
     def on_settings_saved(self, config):
         self.config = config

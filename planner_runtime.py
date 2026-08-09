@@ -1,13 +1,207 @@
 import gc
+import importlib
 import json
 import os
 import sys
+
+import torch
 from copy import deepcopy
 
 from model_registry import get_model_profile
 from planner_protocol import exit_for_fatal_failure, exit_for_memory_retry, is_memory_error, report_success
 
 _ACTIVE_PLAN = None
+
+
+class ConfigProxy:
+    def __init__(self, values=None):
+        self.values = values or {}
+
+    def __getattr__(self, name):
+        if name not in self.values:
+            raise AttributeError(name)
+        value = self.values[name]
+        if isinstance(value, dict):
+            return ConfigProxy(value)
+        return value
+
+    def __getitem__(self, name):
+        value = self.values[name]
+        if isinstance(value, dict):
+            return ConfigProxy(value)
+        return value
+
+    def get(self, name, default=None):
+        value = self.values.get(name, default)
+        if isinstance(value, dict):
+            return ConfigProxy(value)
+        return value
+
+    def to_dict(self):
+        return deepcopy(self.values)
+
+
+class StagedComponentManager:
+    def __init__(self, model_id, plan, profile):
+        self.model_id = model_id
+        self.plan = plan
+        self.profile = profile
+        self.proxies = {}
+        self.current_phase_index = -1
+
+    def add_proxy(self, registry_name, proxy):
+        self.proxies[registry_name] = proxy
+
+    def component_phase_index(self, registry_name):
+        phases = self.profile.get("execution_phases", [])
+        for index in range(max(0, self.current_phase_index), len(phases)):
+            if registry_name in phases[index].get("required_components", []):
+                return index
+        for index, phase in enumerate(phases):
+            if registry_name in phase.get("required_components", []):
+                return index
+        return self.current_phase_index
+
+    def activate(self, registry_name):
+        phase_index = self.component_phase_index(registry_name)
+        if phase_index != self.current_phase_index:
+            self.release_for_phase(phase_index)
+            self.current_phase_index = phase_index
+            phases = self.profile.get("execution_phases", [])
+            if 0 <= phase_index < len(phases):
+                set_runtime_phase(self.plan, phases[phase_index].get("name", "inference"))
+        return self.proxies[registry_name].load_real_component()
+
+    def release_for_phase(self, phase_index):
+        phases = self.profile.get("execution_phases", [])
+        required = set()
+        if 0 <= phase_index < len(phases):
+            required = set(phases[phase_index].get("required_components", []))
+        released = False
+        for registry_name, proxy in self.proxies.items():
+            if registry_name not in required and proxy.real_component is not None:
+                proxy.release()
+                released = True
+        if released:
+            clear_accelerator_cache()
+
+    def release_all(self):
+        released = False
+        for proxy in self.proxies.values():
+            if proxy.real_component is not None:
+                proxy.release()
+                released = True
+        self.current_phase_index = -1
+        if released:
+            clear_accelerator_cache()
+
+
+class LazyStagedComponent(torch.nn.Module):
+    def __init__(self, manager, registry_name, pipeline_name, component_class, model_id, config_values, shardable=False):
+        super().__init__()
+        object.__setattr__(self, "manager", manager)
+        object.__setattr__(self, "registry_name", registry_name)
+        object.__setattr__(self, "pipeline_name", pipeline_name)
+        object.__setattr__(self, "component_class", component_class)
+        object.__setattr__(self, "__module__", component_class.__module__)
+        object.__setattr__(self, "model_id", model_id)
+        object.__setattr__(self, "config_proxy", ConfigProxy(config_values))
+        object.__setattr__(self, "shardable", shardable)
+        object.__setattr__(self, "real_component", None)
+        object.__setattr__(self, "deferred_calls", [])
+
+    @property
+    def __class__(self):
+        return object.__getattribute__(self, "component_class")
+
+    @property
+    def config(self):
+        return object.__getattribute__(self, "config_proxy")
+
+    @property
+    def dtype(self):
+        real_component = object.__getattribute__(self, "real_component")
+        if real_component is not None:
+            return real_component.dtype
+        return component_torch_dtype(object.__getattribute__(self, "registry_name"), object.__getattribute__(self, "manager").plan)
+
+    @property
+    def device(self):
+        real_component = object.__getattribute__(self, "real_component")
+        if real_component is not None and hasattr(real_component, "device"):
+            return real_component.device
+        manager = object.__getattribute__(self, "manager")
+        return torch.device(component_target_device(object.__getattribute__(self, "registry_name"), manager.plan))
+
+    def load_real_component(self):
+        real_component = object.__getattribute__(self, "real_component")
+        if real_component is not None:
+            return real_component
+
+        manager = object.__getattribute__(self, "manager")
+        registry_name = object.__getattribute__(self, "registry_name")
+        component_class = object.__getattribute__(self, "component_class")
+        pipeline_name = object.__getattribute__(self, "pipeline_name")
+        real_component = load_component(
+            component_class,
+            object.__getattribute__(self, "model_id"),
+            registry_name,
+            portable_base_kwargs={"subfolder": pipeline_name},
+            shardable=object.__getattribute__(self, "shardable"),
+            plan=manager.plan,
+        )
+        object.__setattr__(self, "real_component", real_component)
+        for name, args, kwargs in object.__getattribute__(self, "deferred_calls"):
+            method = getattr(real_component, name, None)
+            if method is not None:
+                method(*args, **kwargs)
+        return real_component
+
+    def release(self):
+        object.__setattr__(self, "real_component", None)
+
+    def defer_call(self, name, *args, **kwargs):
+        object.__getattribute__(self, "deferred_calls").append((name, args, kwargs))
+        return self
+
+    def enable_tiling(self, *args, **kwargs):
+        return self.defer_call("enable_tiling", *args, **kwargs)
+
+    def enable_slicing(self, *args, **kwargs):
+        return self.defer_call("enable_slicing", *args, **kwargs)
+
+    def set_attention_backend(self, *args, **kwargs):
+        return self.defer_call("set_attention_backend", *args, **kwargs)
+
+    def encode(self, *args, **kwargs):
+        component = object.__getattribute__(self, "manager").activate(object.__getattribute__(self, "registry_name"))
+        return component.encode(*args, **kwargs)
+
+    def decode(self, *args, **kwargs):
+        component = object.__getattribute__(self, "manager").activate(object.__getattribute__(self, "registry_name"))
+        return component.decode(*args, **kwargs)
+
+    def forward(self, *args, **kwargs):
+        component = object.__getattribute__(self, "manager").activate(object.__getattribute__(self, "registry_name"))
+        return component(*args, **kwargs)
+
+    def __getattr__(self, name):
+        modules = object.__getattribute__(self, "_modules")
+        parameters = object.__getattribute__(self, "_parameters")
+        buffers = object.__getattribute__(self, "_buffers")
+        if name in modules:
+            return modules[name]
+        if name in parameters:
+            return parameters[name]
+        if name in buffers:
+            return buffers[name]
+        if name.startswith("_"):
+            raise AttributeError(name)
+        config_proxy = object.__getattribute__(self, "config_proxy")
+        if name in config_proxy.values:
+            return getattr(config_proxy, name)
+        component = object.__getattribute__(self, "manager").activate(object.__getattribute__(self, "registry_name"))
+        return getattr(component, name)
 
 
 def flag_value(flag):
@@ -253,7 +447,131 @@ def pipeline_component_name(registry_component):
     return registry_component
 
 
-def pipeline_quantization_config(plan=None):
+def pipeline_component_specs(pipeline_class, model_id):
+    config = pipeline_class.load_config(model_id)
+    result = {}
+    for name, value in config.items():
+        if isinstance(value, (list, tuple)) and len(value) == 2 and value[0] and value[1]:
+            result[name] = value
+    return result
+
+
+def resolve_component_class(spec):
+    library_name, class_name = spec
+    module = importlib.import_module(library_name)
+    return getattr(module, class_name)
+
+
+def component_config_values(model_id, pipeline_name):
+    if os.path.isdir(model_id):
+        path = os.path.join(model_id, pipeline_name, "config.json")
+    else:
+        from huggingface_hub import hf_hub_download
+
+        path = hf_hub_download(model_id, os.path.join(pipeline_name, "config.json"))
+    if not os.path.isfile(path):
+        return {}
+    with open(path, "r", encoding="utf-8") as file:
+        return json.load(file)
+
+
+def text_pipeline_names(specs):
+    names = [name for name in specs if name == "text_encoder" or name.startswith("text_encoder_")]
+    return sorted(names, key=lambda name: 1 if name == "text_encoder" else int(name.rsplit("_", 1)[-1]))
+
+
+def registry_pipeline_component_map(profile, specs):
+    mapping = {}
+    used = set()
+    components = profile.get("components", {})
+
+    for registry_name in components:
+        if registry_name in specs:
+            mapping[registry_name] = registry_name
+            used.add(registry_name)
+
+    text_registry = []
+    for registry_name, component in components.items():
+        if registry_name in mapping:
+            continue
+        role = component.get("role", "")
+        if role in ["large_text_encoder", "small_text_encoder"] or "text_encoder" in registry_name or registry_name in ["clip_l", "clip_g", "t5_encoder"]:
+            text_registry.append(registry_name)
+
+    available_text = [name for name in text_pipeline_names(specs) if name not in used]
+    for registry_name, pipeline_name in zip(text_registry, available_text):
+        mapping[registry_name] = pipeline_name
+        used.add(pipeline_name)
+
+    for registry_name, component in components.items():
+        if registry_name in mapping:
+            continue
+        role = component.get("role", "")
+        candidates = []
+        if role == "vae" or "vae" in registry_name or "autoencoder" in registry_name:
+            candidates = ["vae", "autoencoder"]
+        elif "unet" in registry_name:
+            candidates = ["unet"]
+        elif role in ["image_dit", "video_dit"] or "transformer" in registry_name or registry_name == "denoiser":
+            candidates = ["transformer", "unet"]
+        elif role == "vision_encoder" or "vision" in registry_name or "image_encoder" in registry_name:
+            candidates = ["image_encoder", "vision_encoder"]
+        elif role == "llm_decoder" or "vision_language" in registry_name:
+            candidates = ["vision_language_encoder", "text_encoder", "image_encoder"]
+
+        for pipeline_name in candidates:
+            if pipeline_name in specs and pipeline_name not in used:
+                mapping[registry_name] = pipeline_name
+                used.add(pipeline_name)
+                break
+    return mapping
+
+
+def component_is_shardable(component):
+    sharding = str(component.get("sharding", ""))
+    return "block" in sharding or "device_map" in sharding or "shard" in sharding
+
+
+def load_staged_diffusers_pipeline(pipeline_class, model_id, portable_base_kwargs=None, plan=None):
+    plan = plan or get_active_plan()
+    profile = profile_for_plan(plan)
+    if not profile:
+        return pipeline_class.from_pretrained(model_id, **(portable_base_kwargs or {}))
+
+    specs = pipeline_component_specs(pipeline_class, model_id)
+    mapping = registry_pipeline_component_map(profile, specs)
+    manager = StagedComponentManager(model_id, plan, profile)
+    kwargs = deepcopy(portable_base_kwargs or {})
+    kwargs["torch_dtype"] = torch_dtype(plan)
+
+    for registry_name, pipeline_name in mapping.items():
+        if pipeline_name not in specs:
+            continue
+        component = profile.get("components", {}).get(registry_name, {})
+        role = component.get("role", "")
+        if role in ["scheduler", "tokenizer", "processor"]:
+            continue
+        component_class = resolve_component_class(specs[pipeline_name])
+        config_values = component_config_values(model_id, pipeline_name)
+        proxy = LazyStagedComponent(
+            manager,
+            registry_name,
+            pipeline_name,
+            component_class,
+            model_id,
+            config_values,
+            shardable=component_is_shardable(component),
+        )
+        manager.add_proxy(registry_name, proxy)
+        kwargs[pipeline_name] = proxy
+
+    pipe = pipeline_class.from_pretrained(model_id, **kwargs)
+    pipe._staged_component_manager = manager
+    pipe.prepare_next_generation = manager.release_all
+    return pipe
+
+
+def pipeline_quantization_config(plan=None, component_mapping=None):
     plan = plan or get_active_plan()
     if is_exact_fast_path(plan):
         return None
@@ -271,8 +589,8 @@ def pipeline_quantization_config(plan=None):
         if precision == "native" or role in ["vae", "small_text_encoder", "scheduler", "tokenizer", "processor"]:
             continue
 
-        pipeline_name = pipeline_component_name(registry_name)
-        if role in ["large_text_encoder", "small_text_encoder", "vision_encoder", "llm_decoder"]:
+        pipeline_name = (component_mapping or {}).get(registry_name) or pipeline_component_name(registry_name)
+        if role in ["large_text_encoder", "small_text_encoder", "vision_encoder", "vision_language_encoder", "llm_decoder"]:
             config = transformers_quantization_config(registry_name, plan)
         else:
             config = diffusers_quantization_config(registry_name, plan)
@@ -291,17 +609,19 @@ def pipeline_quantization_config(plan=None):
     return PipelineQuantizationConfig(quant_mapping=mapping)
 
 
-def portable_pipeline_kwargs(plan=None):
+def portable_pipeline_kwargs(plan=None, component_mapping=None):
     plan = plan or get_active_plan()
     placement = plan_placement(plan)
     kwargs = {"torch_dtype": torch_dtype(plan)}
-    quantization = pipeline_quantization_config(plan)
+    quantization = pipeline_quantization_config(plan, component_mapping)
     if quantization is not None:
         kwargs["quantization_config"] = quantization
 
     if placement in ["single_gpu_resident", "multi_gpu_device_map", "device_map_with_cpu_overflow"]:
         kwargs["device_map"] = plan.get("device_map") or ("balanced" if logical_gpu_count(plan) > 1 else "cuda")
         kwargs["max_memory"] = plan_max_memory(plan)
+    elif placement == "mps_resident":
+        kwargs["device_map"] = "mps"
     elif placement in ["single_gpu_model_specific_staging", "multi_gpu_model_specific_staging"]:
         kwargs["device_map"] = "balanced" if logical_gpu_count(plan) > 1 else "cuda"
         kwargs["max_memory"] = plan_max_memory(plan)
@@ -318,8 +638,9 @@ def apply_pipeline_plan(pipe, plan=None):
         pipe.enable_model_cpu_offload(gpu_id=0)
     elif placement == "diffusers_sequential_cpu_offload":
         pipe.enable_sequential_cpu_offload(gpu_id=0)
-    elif placement == "mps_resident_or_unified_memory":
-        pipe.to("mps")
+    elif placement in ["mps_resident", "mps_resident_or_unified_memory"]:
+        if placement == "mps_resident_or_unified_memory":
+            pipe.to("mps")
     elif placement == "cpu_only":
         pipe.to("cpu")
     return pipe
@@ -333,8 +654,17 @@ def load_diffusers_pipeline(pipeline_class, model_id, current_kwargs=None, porta
     if not plan or is_exact_fast_path(plan):
         return pipeline_class.from_pretrained(model_id, **current_kwargs)
 
+    if "model_specific_staging" in plan_placement(plan):
+        return load_staged_diffusers_pipeline(pipeline_class, model_id, portable_base_kwargs, plan)
+
+    profile = profile_for_plan(plan)
+    component_mapping = None
+    if profile:
+        specs = pipeline_component_specs(pipeline_class, model_id)
+        component_mapping = registry_pipeline_component_map(profile, specs)
+
     kwargs = portable_base_kwargs
-    kwargs.update(portable_pipeline_kwargs(plan))
+    kwargs.update(portable_pipeline_kwargs(plan, component_mapping))
     pipe = pipeline_class.from_pretrained(model_id, **kwargs)
     return apply_pipeline_plan(pipe, plan)
 
@@ -346,14 +676,17 @@ def component_target_device(component_name, plan=None):
         return execution_device(plan)
     if role == "vae":
         return preview_device(plan)
-    if role in ["large_text_encoder", "small_text_encoder", "vision_encoder"]:
+    if role in ["large_text_encoder", "small_text_encoder", "vision_encoder", "vision_language_encoder"]:
         return execution_device(plan)
     return execution_device(plan)
 
 
 def component_device_map(component_name, plan=None, shardable=False):
     plan = plan or get_active_plan()
-    if plan.get("execution_backend", plan.get("hardware_backend")) != "cuda":
+    execution_backend = plan.get("execution_backend", plan.get("hardware_backend"))
+    if execution_backend == "mps":
+        return {"": "mps"}
+    if execution_backend != "cuda":
         return None
 
     placement = plan_placement(plan)
@@ -381,7 +714,7 @@ def load_component(component_class, model_id, component_name, current_kwargs=Non
     kwargs = portable_base_kwargs
     kwargs["torch_dtype"] = component_torch_dtype(component_name, plan)
     role = component_role(component_name, plan)
-    if role in ["large_text_encoder", "small_text_encoder", "vision_encoder", "llm_decoder"]:
+    if role in ["large_text_encoder", "small_text_encoder", "vision_encoder", "vision_language_encoder", "llm_decoder"]:
         quantization = transformers_quantization_config(component_name, plan)
     else:
         quantization = diffusers_quantization_config(component_name, plan)
@@ -393,7 +726,9 @@ def load_component(component_class, model_id, component_name, current_kwargs=Non
         device_map = component_device_map(component_name, plan, shardable)
     if device_map is not None:
         kwargs["device_map"] = device_map
-        kwargs["max_memory"] = plan_max_memory(plan)
+        max_memory = plan_max_memory(plan)
+        if max_memory:
+            kwargs["max_memory"] = max_memory
 
     component = component_class.from_pretrained(model_id, **kwargs)
     if device_map is None and plan.get("execution_backend", plan.get("hardware_backend")) in ["mps", "cpu"]:

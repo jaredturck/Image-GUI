@@ -8643,6 +8643,14 @@ def component_precision_map(profile, mode):
     return precision_map
 
 
+def weight_precision_key(precision):
+    if precision in ['int8', '8bit', 'bnb_int8']:
+        return 'int8'
+    if precision in ['int4', '4bit', 'bnb_nf4', 'gguf_q4_k_m', 'native_mxfp4', 'checkpoint_native_nf4']:
+        return 'int4'
+    return 'native'
+
+
 def component_map_weight_gib(profile, precision_map, component_names=None):
     names = component_names or list(profile['components'])
     total = 0.0
@@ -8650,9 +8658,7 @@ def component_map_weight_gib(profile, precision_map, component_names=None):
         component = profile['components'].get(component_name)
         if not component:
             continue
-        precision = precision_map.get(component_name, 'native')
-        if precision == 'checkpoint_native':
-            precision = 'native'
+        precision = weight_precision_key(precision_map.get(component_name, 'native'))
         total += component['weight_memory_gib'][precision]
     return round_gib(total)
 
@@ -8660,14 +8666,42 @@ def component_map_weight_gib(profile, precision_map, component_names=None):
 def largest_component_weight_gib(profile, precision_map):
     values = []
     for component_name, component in profile['components'].items():
-        precision = precision_map.get(component_name, 'native')
-        if precision == 'checkpoint_native':
-            precision = 'native'
+        precision = weight_precision_key(precision_map.get(component_name, 'native'))
         values.append(component['weight_memory_gib'][precision])
     return round_gib(max(values or [0.0]))
 
 
-def calculate_phase_memory(profile, precision_map):
+def workload_ratio(value, default):
+    if not isinstance(value, (int, float)) or not isinstance(default, (int, float)) or default <= 0:
+        return 1.0
+    return max(0.1, float(value) / float(default))
+
+
+def phase_workload_scale(profile, phase, workload=None):
+    workload = workload or profile.get('default_workload', {})
+    defaults = profile.get('default_workload', {})
+    scales_with = set(phase.get('dynamic_memory_scales_with', []))
+    scale = 1.0
+
+    if 'width' in scales_with or 'height' in scales_with:
+        width_ratio = workload_ratio(workload.get('width'), defaults.get('width'))
+        height_ratio = workload_ratio(workload.get('height'), defaults.get('height'))
+        scale *= width_ratio * height_ratio
+
+    if 'num_frames' in scales_with:
+        scale *= workload_ratio(workload.get('num_frames'), defaults.get('num_frames'))
+
+    if 'prompt_tokens' in scales_with:
+        scale *= workload_ratio(workload.get('prompt_tokens'), defaults.get('prompt_tokens'))
+
+    for key in ['num_images_per_prompt', 'num_videos_per_prompt']:
+        if key in workload or key in defaults:
+            scale *= workload_ratio(workload.get(key, defaults.get(key, 1)), defaults.get(key, 1))
+
+    return max(0.25, scale)
+
+
+def calculate_phase_memory(profile, precision_map, workload=None):
     phase_memory = {}
     headroom = float(profile.get('runtime_memory', {}).get('default_runtime_headroom_gib', 2.0))
 
@@ -8675,10 +8709,13 @@ def calculate_phase_memory(profile, precision_map):
         phase_name = phase['name']
         required = phase.get('required_components', [])
         static_weight = component_map_weight_gib(profile, precision_map, required)
+        workload_scale = phase_workload_scale(profile, phase, workload)
+        scaled_headroom = max(0.75, headroom * workload_scale)
         phase_memory[phase_name] = {
             'static_weight_gib': static_weight,
-            'estimated_runtime_headroom_gib': round_gib(headroom),
-            'estimated_peak_gib': round_gib(static_weight + headroom),
+            'estimated_runtime_headroom_gib': round_gib(scaled_headroom),
+            'estimated_peak_gib': round_gib(static_weight + scaled_headroom),
+            'workload_scale': round(workload_scale, 3),
             'scales_with': phase.get('dynamic_memory_scales_with', []),
         }
 
@@ -8702,36 +8739,38 @@ def memory_summary(profile):
 
 def plan_system_ram(profile, precision_map, placement):
     weight_gib = component_map_weight_gib(profile, precision_map)
+    phase_memory = calculate_phase_memory(profile, precision_map)
+    largest_phase_weight = max([value['static_weight_gib'] for value in phase_memory.values()] or [weight_gib])
     base_reserve = float(GENERAL_POLICY['default_system_ram_reserve_gib'])
     if placement in ['single_gpu_resident', 'multi_gpu_device_map', 'vllm_tensor_parallel']:
         minimum = max(8.0, min(24.0, weight_gib * 0.25 + base_reserve))
         recommended = max(16.0, min(48.0, weight_gib * 0.5 + base_reserve))
-    elif placement in ['single_gpu_model_specific_staging', 'multi_gpu_model_specific_staging']:
-        minimum = max(16.0, weight_gib + base_reserve)
-        recommended = max(24.0, weight_gib * 1.25 + base_reserve)
+    elif placement in ['single_gpu_model_specific_staging', 'multi_gpu_model_specific_staging', 'mps_model_specific_staging']:
+        minimum = max(4.0, largest_phase_weight + 2.0)
+        recommended = max(8.0, largest_phase_weight + 6.0)
     elif placement in ['device_map_with_cpu_overflow', 'diffusers_model_cpu_offload', 'diffusers_sequential_cpu_offload']:
         minimum = max(16.0, weight_gib + base_reserve)
         recommended = max(24.0, weight_gib * 1.35 + base_reserve)
     elif placement == 'cpu_only':
         minimum = max(16.0, weight_gib * 1.2 + base_reserve)
         recommended = max(24.0, weight_gib * 1.5 + base_reserve)
+    elif placement == 'mps_resident':
+        minimum = weight_gib
+        recommended = weight_gib
     else:
         minimum = max(8.0, weight_gib * 0.5 + base_reserve)
         recommended = max(16.0, weight_gib + base_reserve)
     return round_gib(minimum), round_gib(recommended)
 
 
-def make_candidate_plan(profile, template_id, precision_mode, plan_id=None, notes=None, precision_map=None):
-    template = deepcopy(PLAN_TEMPLATES[template_id])
-    precision_map = deepcopy(precision_map) if precision_map is not None else component_precision_map(profile, precision_mode)
-    placement = template['placement']
-    phase_memory = calculate_phase_memory(profile, precision_map)
+def candidate_memory_estimate(profile, precision_map, placement, workload=None):
+    phase_memory = calculate_phase_memory(profile, precision_map, workload)
     resident_weight = component_map_weight_gib(profile, precision_map)
     largest_component = largest_component_weight_gib(profile, precision_map)
     phase_peak = round_gib(max([value['estimated_peak_gib'] for value in phase_memory.values()] or [0.0]))
-    runtime_headroom = float(profile.get('runtime_memory', {}).get('default_runtime_headroom_gib', 2.0))
+    runtime_headroom = max([value['estimated_runtime_headroom_gib'] for value in phase_memory.values()] or [float(profile.get('runtime_memory', {}).get('default_runtime_headroom_gib', 2.0))])
 
-    if placement == 'single_gpu_resident':
+    if placement in ['single_gpu_resident', 'mps_resident']:
         required_total_vram = resident_weight + runtime_headroom
         largest_gpu = required_total_vram
     elif placement == 'multi_gpu_device_map':
@@ -8740,7 +8779,7 @@ def make_candidate_plan(profile, template_id, precision_mode, plan_id=None, note
     elif placement == 'device_map_with_cpu_overflow':
         required_total_vram = max(runtime_headroom + 3.0, largest_component * 0.35)
         largest_gpu = required_total_vram
-    elif placement == 'single_gpu_model_specific_staging':
+    elif placement in ['single_gpu_model_specific_staging', 'mps_model_specific_staging']:
         required_total_vram = phase_peak
         largest_gpu = phase_peak
     elif placement == 'multi_gpu_model_specific_staging':
@@ -8766,20 +8805,28 @@ def make_candidate_plan(profile, template_id, precision_mode, plan_id=None, note
         largest_gpu = phase_peak
 
     minimum_ram, recommended_ram = plan_system_ram(profile, precision_map, placement)
-    plan = template
-    plan['plan_id'] = plan_id or f"{profile['key']}__{template_id}"
-    plan['template_id'] = template_id
-    plan['component_precision'] = precision_map
-    plan['estimated_memory'] = {
+    return {
         'fully_resident_weight_gib': resident_weight,
         'largest_component_weight_gib': largest_component,
         'required_total_usable_vram_gib': round_gib(required_total_vram),
         'minimum_largest_gpu_usable_vram_gib': round_gib(largest_gpu),
         'minimum_system_ram_gib': minimum_ram,
         'recommended_system_ram_gib': recommended_ram,
-        'basis': 'component_weight_inventory_plus_model_runtime_headroom_estimate',
+        'phases': phase_memory,
+        'basis': 'component_weight_inventory_plus_phase_and_workload_runtime_estimate',
         'runtime_guarantee': False,
     }
+
+
+def make_candidate_plan(profile, template_id, precision_mode, plan_id=None, notes=None, precision_map=None):
+    template = deepcopy(PLAN_TEMPLATES[template_id])
+    precision_map = deepcopy(precision_map) if precision_map is not None else component_precision_map(profile, precision_mode)
+    placement = template['placement']
+    plan = template
+    plan['plan_id'] = plan_id or f"{profile['key']}__{template_id}"
+    plan['template_id'] = template_id
+    plan['component_precision'] = precision_map
+    plan['estimated_memory'] = candidate_memory_estimate(profile, precision_map, placement)
     plan['requirements'] = {
         'backend': 'cuda' if template.get('minimum_gpu_count', 0) else 'cpu_or_accelerator',
         'minimum_gpu_count': template.get('minimum_gpu_count', 0),
@@ -8788,7 +8835,6 @@ def make_candidate_plan(profile, template_id, precision_mode, plan_id=None, note
     }
     plan['notes'] = notes or []
     return plan
-
 
 def existing_fast_path_plan(profile):
     fast_path = profile.get('existing_fast_path', {})
@@ -8930,16 +8976,16 @@ def build_diffusion_plans(profile):
     if multi_gpu:
         plans.append(make_candidate_plan(profile, 'resident_native_multi', 'native'))
 
-    if int8_allowed:
-        plans.append(make_candidate_plan(profile, 'resident_int8_single', 'int8'))
-        if multi_gpu:
-            plans.append(make_candidate_plan(profile, 'resident_int8_multi', 'int8'))
-
     if placement.get('custom_staging'):
         plans.append(make_candidate_plan(profile, 'staged_native_single', 'native'))
         if multi_gpu:
             plans.append(make_candidate_plan(profile, 'staged_native_multi', 'native'))
-        if int8_allowed:
+
+    if int8_allowed:
+        plans.append(make_candidate_plan(profile, 'resident_int8_single', 'int8'))
+        if multi_gpu:
+            plans.append(make_candidate_plan(profile, 'resident_int8_multi', 'int8'))
+        if placement.get('custom_staging'):
             plans.append(make_candidate_plan(profile, 'staged_int8_single', 'int8'))
             if multi_gpu:
                 plans.append(make_candidate_plan(profile, 'staged_int8_multi', 'int8'))
@@ -8985,8 +9031,39 @@ def build_candidate_plans(profile):
     return build_diffusion_plans(profile)
 
 
+def apply_workload_policy(profile):
+    workload = deepcopy(profile.get('default_workload', {}))
+    category = profile.get('category')
+
+    if category == 'image_diffusion':
+        if 'num_images_per_prompt' not in workload:
+            workload['num_images_per_prompt'] = max(1, int(workload.get('batch_size', 1)))
+        workload['batch_size'] = 1
+        profile['workload_policy'] = {
+            'fixed': ['width', 'height'],
+            'adjustable': {
+                'num_images_per_prompt': {'minimum': 1},
+            },
+        }
+    elif category == 'image_diffusion_upscale':
+        profile['workload_policy'] = {
+            'fixed': ['input_width', 'input_height', 'scale'],
+            'adjustable': {},
+        }
+    elif category == 'video_diffusion':
+        profile['workload_policy'] = {
+            'fixed': ['width', 'height'],
+            'adjustable': {
+                'num_videos_per_prompt': {'minimum': 1},
+            },
+        }
+
+    profile['default_workload'] = workload
+
+
 def enrich_profile(raw_profile):
     profile = deepcopy(raw_profile)
+    apply_workload_policy(profile)
     profile['components'] = {
         name: enrich_component_memory(profile, component)
         for name, component in profile['components'].items()

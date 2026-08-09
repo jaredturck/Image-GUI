@@ -1001,9 +1001,11 @@ class Kandinsky5I2VGenerator:
     def prepare_latents(self, image, height, width, num_frames, seed):
         set_runtime_phase(self.plan, "vae_source_encode")
         device = torch.device(self.secondary_device)
-        generator = torch.Generator(device=device).manual_seed(seed)
+        generator_device = "cpu" if device.type == "mps" else device
+        generator = torch.Generator(device=generator_device).manual_seed(seed)
         num_latent_frames = (num_frames - 1) // self.vae.config.temporal_compression_ratio + 1
 
+        latent_device = "cpu" if device.type == "mps" else device
         latents = torch.randn(
             1,
             num_latent_frames,
@@ -1011,9 +1013,9 @@ class Kandinsky5I2VGenerator:
             width // self.vae.config.spatial_compression_ratio,
             16,
             generator=generator,
-            device=device,
+            device=latent_device,
             dtype=torch_dtype(self.plan)
-        )
+        ).to(device)
 
         self.vae.to(device)
 
@@ -1022,7 +1024,12 @@ class Kandinsky5I2VGenerator:
             dtype=torch_dtype(self.plan)
         )
 
-        image_latents = self.vae.encode(image_tensor.unsqueeze(2)).latent_dist.sample(generator=generator)
+        latent_dist = self.vae.encode(image_tensor.unsqueeze(2)).latent_dist
+        if device.type == "mps":
+            torch.mps.manual_seed(seed)
+            image_latents = latent_dist.sample()
+        else:
+            image_latents = latent_dist.sample(generator=generator)
         image_latents = image_latents * self.vae.config.scaling_factor
         image_latents = image_latents.permute(0, 2, 3, 4, 1).to(latents.device, latents.dtype)
 

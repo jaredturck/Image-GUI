@@ -9,7 +9,7 @@ from copy import deepcopy
 
 from app_config import config_dir, load_user_config
 from hardware_detection import detect_hardware, hardware_summary
-from model_registry import MODEL_PROFILES, PLAN_TEMPLATES, get_model_profile, make_candidate_plan, resolve_model_key
+from model_registry import MODEL_PROFILES, PLAN_TEMPLATES, candidate_memory_estimate, get_model_profile, make_candidate_plan, resolve_model_key
 from plan_history import failed_attempt_ids, successful_plan
 
 
@@ -24,13 +24,6 @@ SPEED_ORDER = {
     "emergency": 7,
 }
 
-
-
-IMPLEMENTED_STAGING_LOADERS = {
-    "Flux2Generator",
-    "QwenImageEditGenerator",
-    "Kandinsky5I2VGenerator",
-}
 
 QUALITY_ORDER = {
     "model_intended": 0,
@@ -104,10 +97,11 @@ def candidate_backend_allowed(candidate, profile, hardware):
     requirements = candidate.get("requirements", {})
     required_backend = requirements.get("backend")
 
-    if placement == "mps_resident_or_unified_memory":
+    if placement in ["mps_resident", "mps_model_specific_staging", "mps_resident_or_unified_memory"]:
         return backend == "mps", "requires Apple MPS"
     if placement == "cpu_only":
-        return backend == "cpu" or profile.get("backend_support", {}).get("cpu"), "CPU backend is unsupported"
+        cpu_support = str(profile.get("backend_support", {}).get("cpu", ""))
+        return backend == "cpu" or bool(cpu_support), "CPU backend is unsupported"
     if placement == "comfyui_managed":
         return True, ""
     if placement == "vllm_tensor_parallel":
@@ -116,6 +110,8 @@ def candidate_backend_allowed(candidate, profile, hardware):
         if not hardware.get("supports_vllm"):
             return False, "vLLM is not installed"
         return True, ""
+    if required_backend == "mps":
+        return backend == "mps", "plan requires Apple MPS"
     if required_backend == "cuda_or_cpu":
         return backend in ["cuda", "cpu"], "plan requires CUDA or CPU"
     if required_backend == "comfyui":
@@ -125,7 +121,6 @@ def candidate_backend_allowed(candidate, profile, hardware):
     if backend == "cuda":
         return True, ""
     return False, f"plan is CUDA-specific and detected backend is {backend}"
-
 
 def exact_fast_path_matches(candidate, hardware):
     match = candidate.get("hardware_match", {})
@@ -220,7 +215,7 @@ def choose_exact_fast_path_gpus(candidate, hardware, preferred_gpu=None):
 
 def choose_gpus(candidate, hardware, preferred_gpu=None):
     placement = candidate.get("placement")
-    if placement in ["cpu_only", "mps_resident_or_unified_memory", "comfyui_managed"]:
+    if placement in ["cpu_only", "mps_resident", "mps_model_specific_staging", "mps_resident_or_unified_memory", "comfyui_managed"]:
         return []
     if candidate.get("template_id") == "current_exact_fast_path":
         return choose_exact_fast_path_gpus(candidate, hardware, preferred_gpu)
@@ -241,10 +236,8 @@ def candidate_filter(candidate, profile, hardware, preferred_gpu=None):
     if checkpoint_format == "gguf_q4_k_m" and placement not in ["existing_code_path", "vllm_tensor_parallel"]:
         return False, "the GGUF artifact is currently implemented through the vLLM executor", []
 
-    if "model_specific_staging" in str(placement):
-        loader = profile.get("current_code", {}).get("loader")
-        if loader not in IMPLEMENTED_STAGING_LOADERS:
-            return False, "this application has no model-specific staged executor for the candidate", []
+    if "model_specific_staging" in str(placement) and not profile.get("placement_support", {}).get("custom_staging"):
+        return False, "the model profile does not support staged execution", []
 
     allowed, reason = candidate_backend_allowed(candidate, profile, hardware)
     if not allowed:
@@ -273,10 +266,11 @@ def candidate_filter(candidate, profile, hardware, preferred_gpu=None):
     minimum_ram = float(candidate.get("estimated_memory", {}).get("minimum_system_ram_gib", 0.0))
     if placement == "cpu_only":
         minimum_ram = cpu_plan_required_ram_gib(candidate, profile)
-    elif placement == "mps_resident_or_unified_memory":
-        minimum_ram = max(minimum_ram, mps_plan_required_ram_gib(candidate))
+    elif placement in ["mps_resident", "mps_model_specific_staging", "mps_resident_or_unified_memory"]:
+        minimum_ram = mps_plan_required_ram_gib(candidate)
 
-    if minimum_ram > float(hardware.get("usable_system_ram_gib", 0.0)):
+    memory_tolerance = 0.1 if hardware.get("backend") == "mps" else 0.0
+    if minimum_ram > float(hardware.get("usable_system_ram_gib", 0.0)) + memory_tolerance:
         return False, f"requires at least {minimum_ram:.1f} GiB usable system RAM", []
 
     selected_gpus = choose_gpus(candidate, hardware, preferred_gpu)
@@ -303,7 +297,7 @@ def budget_steps_for(candidate, config):
     placement = candidate.get("placement")
     if candidate.get("template_id") == "current_exact_fast_path":
         return [0.0]
-    if placement in ["cpu_only", "mps_resident_or_unified_memory", "comfyui_managed"]:
+    if placement in ["cpu_only", "mps_resident", "mps_model_specific_staging", "mps_resident_or_unified_memory", "comfyui_managed"]:
         return [0.0]
     if placement in ["single_gpu_resident"]:
         return [0.0, 0.5]
@@ -336,12 +330,84 @@ def plan_dtype(profile, hardware, candidate=None):
             return "float32"
         return "float32"
     if hardware["backend"] == "mps":
+        if hardware.get("supports_bfloat16") and "bfloat16" in native_dtype:
+            return "bfloat16"
         return "float16"
     if hardware.get("supports_bfloat16") and "bfloat16" in native_dtype:
         return "bfloat16"
     if native_dtype == "float32":
         return "float32"
     return "float16"
+
+
+def workload_variant_tag(requested_workload, effective_workload):
+    parts = []
+    labels = {
+        "num_images_per_prompt": "images",
+        "num_videos_per_prompt": "videos",
+    }
+    for key, label in labels.items():
+        requested = (requested_workload or {}).get(key)
+        effective = (effective_workload or {}).get(key)
+        if requested is not None and effective is not None and requested != effective:
+            parts.append(f"{label}_{effective}")
+    return "__".join(parts)
+
+
+def workload_variants(profile, workload):
+    requested = deepcopy(workload or profile.get("default_workload", {}))
+    variants = [requested]
+    adjustable = profile.get("workload_policy", {}).get("adjustable", {})
+
+    for key, policy in adjustable.items():
+        current = requested.get(key)
+        minimum = int(policy.get("minimum", 1))
+        if not isinstance(current, (int, float)) or int(current) <= minimum:
+            continue
+        for value in range(int(current) - 1, minimum - 1, -1):
+            variant = deepcopy(requested)
+            variant[key] = value
+            if variant not in variants:
+                variants.append(variant)
+
+    return variants
+
+
+def candidate_for_workload(candidate, profile, workload):
+    result = deepcopy(candidate)
+    result["estimated_memory"] = candidate_memory_estimate(
+        profile,
+        result.get("component_precision", {}),
+        result.get("placement"),
+        workload,
+    )
+    return result
+
+
+def mps_candidate(candidate, profile):
+    placement_map = {
+        "single_gpu_resident": "mps_resident",
+        "single_gpu_model_specific_staging": "mps_model_specific_staging",
+    }
+    placement = candidate.get("placement")
+    if placement not in placement_map:
+        return None
+
+    result = deepcopy(candidate)
+    result["placement"] = placement_map[placement]
+    result["plan_id"] = f"{candidate['plan_id']}__mps"
+    result["requirements"] = deepcopy(result.get("requirements", {}))
+    result["requirements"]["backend"] = "mps"
+    result["requirements"]["minimum_gpu_count"] = 0
+    result["requirements"]["requires_system_ram_for_weights"] = True
+    result["estimated_memory"] = candidate_memory_estimate(
+        profile,
+        result.get("component_precision", {}),
+        result["placement"],
+        profile.get("default_workload", {}),
+    )
+    result["notes"] = list(result.get("notes", [])) + ["Apple MPS unified-memory variant of the portable plan."]
+    return result
 
 
 def build_status_text(candidate, selected_gpus):
@@ -355,17 +421,20 @@ def build_status_text(candidate, selected_gpus):
     return f"{precision.upper()} · {placement}"
 
 
-def build_concrete_attempt(candidate, profile, hardware, selected_gpus, budget_reduction, model_reference, workload, candidate_index, result_file):
+def build_concrete_attempt(candidate, profile, hardware, selected_gpus, budget_reduction, model_reference, workload, requested_workload, candidate_index, result_file):
     physical_ids = [int(gpu["index"]) for gpu in selected_gpus]
     mapping = logical_gpu_map(selected_gpus)
     attempt_suffix = str(budget_reduction).replace(".", "p")
+    workload_tag = workload_variant_tag(requested_workload, workload)
     attempt_id = f"{candidate['plan_id']}__reserve_{attempt_suffix}"
+    if workload_tag:
+        attempt_id = f"{attempt_id}__{workload_tag}"
 
     plan = deepcopy(candidate)
     placement = candidate.get("placement")
     if placement == "cpu_only":
         execution_backend = "cpu"
-    elif placement == "mps_resident_or_unified_memory":
+    elif placement in ["mps_resident", "mps_model_specific_staging", "mps_resident_or_unified_memory"]:
         execution_backend = "mps"
     else:
         execution_backend = hardware["backend"]
@@ -401,6 +470,8 @@ def build_concrete_attempt(candidate, profile, hardware, selected_gpus, budget_r
         "preview_device": secondary,
         "torch_dtype": plan_dtype(profile, hardware, candidate),
         "workload": workload or deepcopy(profile.get("default_workload", {})),
+        "requested_workload": requested_workload or deepcopy(profile.get("default_workload", {})),
+        "workload_adjusted": bool(workload_tag),
         "result_file": result_file,
         "status_text": build_status_text(candidate, selected_gpus),
         "profile_summary": {
@@ -440,13 +511,20 @@ def build_concrete_attempt(candidate, profile, hardware, selected_gpus, budget_r
 
 
 def add_backend_fallback_candidates(profile, hardware, candidates):
+    if hardware["backend"] == "mps":
+        support = str(profile.get("backend_support", {}).get("mps", ""))
+        result = []
+        if "unsupported" not in support and "not_supported" not in support:
+            for candidate in candidates:
+                converted = mps_candidate(candidate, profile)
+                if converted is not None:
+                    result.append(converted)
+                elif candidate.get("placement") in ["cpu_only", "comfyui_managed"]:
+                    result.append(deepcopy(candidate))
+        return result
+
     result = list(candidates)
     placements = {candidate.get("placement") for candidate in result}
-
-    if hardware["backend"] == "mps" and "mps_resident_or_unified_memory" not in placements:
-        support = str(profile.get("backend_support", {}).get("mps", ""))
-        if "unsupported" not in support:
-            result.insert(0, make_candidate_plan(profile, "mps_native", "native"))
 
     if hardware["backend"] == "cpu" and "cpu_only" not in placements:
         support = str(profile.get("backend_support", {}).get("cpu", ""))
@@ -470,38 +548,46 @@ def plan_attempts(model_reference, workload=None, preferred_gpu=None, hardware=N
 
     config = load_user_config()
     candidates = add_backend_fallback_candidates(profile, hardware, profile.get("candidate_plans", []))
-    failed = failed_attempt_ids(hardware["signature"], profile["key"], workload or profile.get("default_workload", {}))
-    validated = successful_plan(hardware["signature"], profile["key"], workload or profile.get("default_workload", {}))
+    requested_workload = deepcopy(workload or profile.get("default_workload", {}))
+    variants = workload_variants(profile, requested_workload)
+    failed = failed_attempt_ids(hardware["signature"], profile["key"], requested_workload)
+    validated = successful_plan(hardware["signature"], profile["key"], requested_workload)
     attempts = []
     rejections = []
     result_dir = os.path.join(config_dir(), "planner_results")
     os.makedirs(result_dir, exist_ok=True)
 
-    for candidate_index, candidate in enumerate(candidates):
-        allowed, reason, selected_gpus = candidate_filter(candidate, profile, hardware, preferred_gpu)
-        if not allowed:
-            rejections.append({"plan_id": candidate.get("plan_id"), "reason": reason})
-            continue
-
-        for budget_reduction in budget_steps_for(candidate, config):
-            result_file = os.path.join(result_dir, f"{uuid.uuid4().hex}.json")
-            attempt = build_concrete_attempt(
-                candidate,
-                profile,
-                hardware,
-                selected_gpus,
-                budget_reduction,
-                model_reference,
-                workload or deepcopy(profile.get("default_workload", {})),
-                candidate_index,
-                result_file,
-            )
-            attempt["restore_workload"] = workload is not None
-
-            if attempt["attempt_id"] in failed:
-                rejections.append({"plan_id": attempt["attempt_id"], "reason": "previously failed on this hardware and workload"})
+    for effective_workload in variants:
+        for candidate_index, source_candidate in enumerate(candidates):
+            candidate = candidate_for_workload(source_candidate, profile, effective_workload)
+            allowed, reason, selected_gpus = candidate_filter(candidate, profile, hardware, preferred_gpu)
+            if not allowed:
+                tag = workload_variant_tag(requested_workload, effective_workload)
+                rejection_id = candidate.get("plan_id") if not tag else f"{candidate.get('plan_id')}__{tag}"
+                rejections.append({"plan_id": rejection_id, "reason": reason})
                 continue
-            attempts.append(attempt)
+
+            for budget_reduction in budget_steps_for(candidate, config):
+                result_file = os.path.join(result_dir, f"{uuid.uuid4().hex}.json")
+                attempt = build_concrete_attempt(
+                    candidate,
+                    profile,
+                    hardware,
+                    selected_gpus,
+                    budget_reduction,
+                    model_reference,
+                    effective_workload,
+                    requested_workload,
+                    candidate_index,
+                    result_file,
+                )
+                default_workload = profile.get("default_workload", {})
+                attempt["restore_workload"] = workload is not None or effective_workload != default_workload
+
+                if attempt["attempt_id"] in failed:
+                    rejections.append({"plan_id": attempt["attempt_id"], "reason": "previously failed on this hardware and workload"})
+                    continue
+                attempts.append(attempt)
 
     if validated:
         matching = [attempt for attempt in attempts if attempt["attempt_id"] == validated.get("attempt_id")]
@@ -511,7 +597,7 @@ def plan_attempts(model_reference, workload=None, preferred_gpu=None, hardware=N
     if not attempts:
         return {
             "status": "cannot_run",
-            "reason": "No supported loading plan fits the detected backend, GPU capacity, and system RAM constraints.",
+            "reason": "No supported loading plan fits the detected backend and physical memory constraints.",
             "model_key": profile["key"],
             "attempts": [],
             "rejections": rejections,
@@ -527,7 +613,6 @@ def plan_attempts(model_reference, workload=None, preferred_gpu=None, hardware=N
         "hardware": hardware,
         "validated_plan": validated,
     }
-
 
 def save_plan_file(plan):
     os.makedirs(os.path.join(config_dir(), "active_plans"), exist_ok=True)

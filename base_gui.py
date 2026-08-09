@@ -265,6 +265,10 @@ class DiffusionGUI:
         os.makedirs(self.image_folder, exist_ok=True)
         subprocess.Popen(["xdg-open", os.path.abspath(self.image_folder)])
     
+    def open_cachelight(self):
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        subprocess.Popen([sys.executable, os.path.join(base_dir, "cachelight.py")], cwd=base_dir)
+
     def open_image_editor(self):
         base_dir = os.path.dirname(os.path.abspath(__file__))
         script = os.path.join(base_dir, "img_editor.py")
@@ -448,6 +452,8 @@ class DiffusionGUI:
 
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(int(seed))
+        elif hasattr(torch, "mps") and torch.backends.mps.is_available():
+            torch.mps.manual_seed(int(seed))
 
     def get_generator(self, device="cpu"):
         seed = self.active_seed if self.active_seed is not None else self.get_seed()
@@ -1030,6 +1036,7 @@ class DiffusionGUI:
         gallery_header.grid_columnconfigure(2, weight=0)
         gallery_header.grid_columnconfigure(3, weight=0)
         gallery_header.grid_columnconfigure(4, weight=0)
+        gallery_header.grid_columnconfigure(5, weight=0)
 
         gallery_title = ctk.CTkLabel(gallery_header, text=self.gallery_title, font=ctk.CTkFont(size=18, weight="bold"))
         gallery_title.grid(row=0, column=0, sticky="w")
@@ -1044,8 +1051,11 @@ class DiffusionGUI:
         open_folder_btn = ctk.CTkButton(gallery_header, text="📁", width=36, command=self.open_output_folder)
         open_folder_btn.grid(row=0, column=3, sticky="e", padx=(0, 8))
 
+        cachelight_btn = ctk.CTkButton(gallery_header, text="◫", width=36, command=self.open_cachelight)
+        cachelight_btn.grid(row=0, column=4, sticky="e", padx=(0, 8))
+
         refresh_btn = ctk.CTkButton(gallery_header, text="↻", width=36, command=self.refresh_gallery)
-        refresh_btn.grid(row=0, column=4, sticky="e")
+        refresh_btn.grid(row=0, column=5, sticky="e")
         self.stop_btn.configure(state="disabled")
 
         self.gallery = ctk.CTkScrollableFrame(right, corner_radius=16)

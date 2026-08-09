@@ -49,6 +49,7 @@ DEFAULT_CONFIG = {
         "small_gpu_reserve_gib": 1.0,
         "small_gpu_threshold_gib": 12.0,
         "system_ram_reserve_gib": 6.0,
+        "mps_system_ram_reserve_gib": 1.0,
         "budget_retry_steps_gib": [0.0, 0.5, 1.0, 2.0],
         "automatic_retry": True,
     },
@@ -130,6 +131,23 @@ def save_user_config(config):
 def get_path(name, fallback=""):
     value = load_user_config().get("paths", {}).get(name, "")
     return value or fallback
+
+
+def huggingface_cache_root():
+    configured = get_path("huggingface_cache_dir").strip()
+    if configured:
+        return os.path.abspath(os.path.expanduser(configured))
+
+    hf_home = os.environ.get("HF_HOME", "").strip()
+    if hf_home:
+        return os.path.abspath(os.path.expanduser(hf_home))
+
+    hub_cache = os.environ.get("HF_HUB_CACHE", "").strip()
+    if hub_cache:
+        path = os.path.abspath(os.path.expanduser(hub_cache))
+        return os.path.dirname(path) if os.path.basename(path) == "hub" else path
+
+    return os.path.join(os.path.expanduser("~"), ".cache", "huggingface")
 
 
 def default_output_root():

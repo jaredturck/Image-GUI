@@ -38,6 +38,25 @@ def version_of(package_name):
         return "unavailable"
 
 
+def version_tuple(value):
+    parts = []
+    for token in str(value).replace("+", ".").replace("-", ".").split("."):
+        digits = "".join(character for character in token if character.isdigit())
+        if not digits:
+            break
+        parts.append(int(digits))
+    return tuple(parts)
+
+
+def version_at_least(value, minimum):
+    current = version_tuple(value)
+    required = version_tuple(minimum)
+    length = max(len(current), len(required))
+    current += (0,) * (length - len(current))
+    required += (0,) * (length - len(required))
+    return current >= required
+
+
 def cuda_driver_available_without_torch():
     command = ["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader,nounits"]
     try:
@@ -66,6 +85,12 @@ def reserve_for_gpu(total_gib, config):
     if total_gib <= float(planner["small_gpu_threshold_gib"]):
         return float(planner["small_gpu_reserve_gib"])
     return float(planner["cuda_gpu_reserve_gib"])
+
+
+def reserve_for_mps(total_gib, config):
+    minimum = float(config["planner"].get("mps_system_ram_reserve_gib", 1.0))
+    scaled = min(8.0, float(total_gib) * 0.10)
+    return max(minimum, scaled)
 
 
 def detect_with_torch(config):
@@ -129,16 +154,39 @@ def detect_with_torch(config):
 
     elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
         profile["backend"] = "mps"
-        profile["supports_bfloat16"] = False
-        profile["supports_bitsandbytes_int8"] = False
-        profile["supports_bitsandbytes_nf4"] = False
+        bitsandbytes_version = version_of("bitsandbytes")
+        bitsandbytes_mps = (
+            platform.system() == "Darwin"
+            and platform.machine().lower() in ["arm64", "aarch64"]
+            and module_available("bitsandbytes")
+            and version_at_least(bitsandbytes_version, "0.49.0")
+        )
+        supports_bfloat16 = False
+        if hasattr(torch.backends.mps, "is_macos_or_newer"):
+            supports_bfloat16 = bool(torch.backends.mps.is_macos_or_newer(14, 0))
+
+        profile["supports_bfloat16"] = supports_bfloat16
+        profile["supports_bitsandbytes_int8"] = bitsandbytes_mps
+        profile["supports_bitsandbytes_nf4"] = bitsandbytes_mps
+        profile["mps"] = {
+            "name": torch.backends.mps.get_name() if hasattr(torch.backends.mps, "get_name") else "Apple GPU",
+            "core_count": torch.backends.mps.get_core_count() if hasattr(torch.backends.mps, "get_core_count") else None,
+            "unified_memory_gib": profile["system_ram_gib"],
+        }
     else:
         bitsandbytes_available = module_available("bitsandbytes")
         profile["supports_bitsandbytes_int8"] = bitsandbytes_available
         profile["supports_bitsandbytes_nf4"] = bitsandbytes_available
 
-    reserve = float(config["planner"]["system_ram_reserve_gib"])
+    if profile["backend"] == "mps":
+        reserve = reserve_for_mps(profile["system_ram_gib"], config)
+    else:
+        reserve = float(config["planner"]["system_ram_reserve_gib"])
+    profile["system_ram_reserve_gib"] = reserve
     profile["usable_system_ram_gib"] = round(max(0.0, profile["system_ram_gib"] - reserve), 3)
+    if profile.get("mps") is not None:
+        profile["mps"]["reserve_gib"] = reserve
+        profile["mps"]["usable_unified_memory_gib"] = profile["usable_system_ram_gib"]
     return profile
 
 
@@ -157,17 +205,20 @@ def detect_hardware(allow_torch=True):
             gpu["supports_bitsandbytes_int8"] = module_available("bitsandbytes")
             gpu["supports_bitsandbytes_nf4"] = module_available("bitsandbytes")
 
-        backend = "cuda" if gpus else ("mps" if platform.system() == "Darwin" else "cpu")
+        apple_silicon = platform.system() == "Darwin" and platform.machine().lower() in ["arm64", "aarch64"]
+        backend = "cuda" if gpus else ("mps" if apple_silicon else "cpu")
         system_ram_gib = round(total_system_ram_bytes() / GIB, 3)
+        reserve = reserve_for_mps(system_ram_gib, config) if backend == "mps" else float(config["planner"]["system_ram_reserve_gib"])
         profile = {
             "backend": backend,
             "gpus": gpus,
             "system_ram_gib": system_ram_gib,
-            "usable_system_ram_gib": round(max(0.0, system_ram_gib - float(config["planner"]["system_ram_reserve_gib"])), 3),
+            "system_ram_reserve_gib": reserve,
+            "usable_system_ram_gib": round(max(0.0, system_ram_gib - reserve), 3),
             "supports_bfloat16": None,
             "supports_float16": True,
-            "supports_bitsandbytes_int8": module_available("bitsandbytes"),
-            "supports_bitsandbytes_nf4": module_available("bitsandbytes"),
+            "supports_bitsandbytes_int8": module_available("bitsandbytes") and (backend != "mps" or (apple_silicon and version_at_least(version_of("bitsandbytes"), "0.49.0"))),
+            "supports_bitsandbytes_nf4": module_available("bitsandbytes") and (backend != "mps" or (apple_silicon and version_at_least(version_of("bitsandbytes"), "0.49.0"))),
             "supports_vllm": module_available("vllm"),
             "torch_version": version_of("torch"),
         }
@@ -202,6 +253,7 @@ def detect_hardware(allow_torch=True):
             "small_gpu_reserve_gib": config["planner"]["small_gpu_reserve_gib"],
             "small_gpu_threshold_gib": config["planner"]["small_gpu_threshold_gib"],
             "system_ram_reserve_gib": config["planner"]["system_ram_reserve_gib"],
+            "mps_system_ram_reserve_gib": config["planner"].get("mps_system_ram_reserve_gib", 1.0),
         },
     }
     encoded = json.dumps(signature_data, sort_keys=True).encode("utf-8")
@@ -218,7 +270,10 @@ def hardware_summary(profile):
         return f"CUDA: {gpu_text}; RAM {profile['system_ram_gib']:.1f} GiB"
 
     if profile["backend"] == "mps":
-        return f"Apple MPS unified memory; RAM {profile['system_ram_gib']:.1f} GiB"
+        mps = profile.get("mps", {})
+        name = mps.get("name", "Apple GPU")
+        usable = profile.get("usable_system_ram_gib", profile["system_ram_gib"])
+        return f"MPS: {name}; unified memory {profile['system_ram_gib']:.1f} GiB ({usable:.1f} GiB planner budget)"
 
     return f"CPU only; RAM {profile['system_ram_gib']:.1f} GiB"
 

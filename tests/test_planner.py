@@ -1,7 +1,10 @@
 import unittest
 
+from app_config import DEFAULT_CONFIG
+from hardware_detection import reserve_for_mps
 from hardware_planner import plan_attempts
-from model_registry import LAUNCHER_MODEL_IDS, VALIDATION_ERRORS, get_model_profile
+from model_registry import LAUNCHER_MODEL_IDS, MODEL_PROFILES, VALIDATION_ERRORS, candidate_memory_estimate, get_model_profile
+from plan_history import workload_covers
 from planner_runtime import build_block_device_map
 
 
@@ -22,18 +25,20 @@ def fake_hardware(signature, backend, system_ram_gib, gpu_sizes=None, bitsandbyt
             "supports_bitsandbytes_nf4": bitsandbytes,
         })
 
+    ram_reserve = 1.0 if backend == "mps" else 6.0
     return {
         "backend": backend,
         "gpus": gpus,
         "system_ram_gib": float(system_ram_gib),
-        "usable_system_ram_gib": max(0.0, float(system_ram_gib) - 6.0),
-        "supports_bfloat16": backend == "cuda",
+        "system_ram_reserve_gib": ram_reserve,
+        "usable_system_ram_gib": max(0.0, float(system_ram_gib) - ram_reserve),
+        "supports_bfloat16": backend in ["cuda", "mps"],
         "supports_float16": True,
-        "supports_bitsandbytes_int8": bitsandbytes and backend == "cuda",
-        "supports_bitsandbytes_nf4": bitsandbytes and backend == "cuda",
+        "supports_bitsandbytes_int8": bitsandbytes and backend in ["cuda", "mps"],
+        "supports_bitsandbytes_nf4": bitsandbytes and backend in ["cuda", "mps"],
         "supports_vllm": vllm and backend == "cuda",
         "signature": signature,
-        "platform": "linux",
+        "platform": "darwin" if backend == "mps" else "linux",
         "software": {},
     }
 
@@ -155,6 +160,101 @@ class PlannerTests(unittest.TestCase):
         self.assertTrue(int4_plans)
         for plan in int4_plans:
             self.assertEqual(plan["component_precision"]["vae"], "native")
+
+    def test_mps_kandinsky_uses_staging_without_changing_resolution(self):
+        hardware = fake_hardware("mps_8", "mps", 8, [], bitsandbytes=True, vllm=False)
+        result = plan_attempts("kandinsky_5_t2i_lite_sft", hardware=hardware)
+        self.assertEqual(result["status"], "ready")
+        first = result["attempts"][0]
+        self.assertEqual(first["execution_backend"], "mps")
+        self.assertEqual(first["placement"], "mps_model_specific_staging")
+        self.assertEqual(first["workload"]["width"], 1280)
+        self.assertEqual(first["workload"]["height"], 768)
+        self.assertEqual(first["workload"]["num_images_per_prompt"], 1)
+        self.assertEqual(first["component_precision"]["qwen_text_encoder"], "int4")
+        self.assertEqual(first["component_precision"]["clip_text_encoder"], "native")
+        self.assertEqual(first["component_precision"]["vae"], "native")
+
+    def test_mps_more_memory_selects_higher_quality_plans(self):
+        medium = plan_attempts("kandinsky_5_t2i_lite_sft", hardware=fake_hardware("mps_16", "mps", 16, [], bitsandbytes=True, vllm=False))
+        large = plan_attempts("kandinsky_5_t2i_lite_sft", hardware=fake_hardware("mps_32", "mps", 32, [], bitsandbytes=True, vllm=False))
+        self.assertEqual(medium["attempts"][0]["template_id"], "staged_int8_single")
+        self.assertEqual(large["attempts"][0]["template_id"], "resident_native_single")
+        self.assertEqual(medium["attempts"][0]["workload"]["num_images_per_prompt"], 3)
+        self.assertEqual(large["attempts"][0]["workload"]["num_images_per_prompt"], 3)
+
+    def test_mps_quantization_capability_is_respected(self):
+        hardware = fake_hardware("mps_8_no_bnb", "mps", 8, [], bitsandbytes=False, vllm=False)
+        result = plan_attempts("kandinsky_5_t2i_lite_sft", hardware=hardware)
+        self.assertEqual(result["status"], "cannot_run")
+
+    def test_kandinsky_progressive_quantization_protects_vae_and_clip(self):
+        profile = get_model_profile("kandinsky_5_t2i_lite_sft")
+        plans = [plan for plan in profile["candidate_plans"] if plan.get("template_id") == "staged_int4_single"]
+        self.assertGreaterEqual(len(plans), 2)
+        self.assertEqual(plans[0]["component_precision"]["qwen_text_encoder"], "int4")
+        self.assertEqual(plans[0]["component_precision"]["transformer"], "int8")
+        self.assertEqual(plans[0]["component_precision"]["clip_text_encoder"], "native")
+        self.assertEqual(plans[0]["component_precision"]["vae"], "native")
+        self.assertEqual(plans[1]["component_precision"]["transformer"], "int4")
+        self.assertEqual(plans[1]["component_precision"]["vae"], "native")
+
+    def test_staged_candidates_exist_for_most_diffusion_profiles(self):
+        staged_profiles = [profile for profile in MODEL_PROFILES.values() if profile.get("placement_support", {}).get("custom_staging")]
+        supported = [profile for profile in staged_profiles if any("model_specific_staging" in plan.get("placement", "") for plan in profile.get("candidate_plans", []))]
+        self.assertGreaterEqual(len(staged_profiles), 20)
+        self.assertEqual(len(supported), len(staged_profiles))
+
+    def test_concurrent_image_count_changes_phase_memory_but_not_resolution(self):
+        profile = get_model_profile("kandinsky_5_t2i_lite_sft")
+        plan = next(plan for plan in profile["candidate_plans"] if plan.get("template_id") == "staged_int8_single")
+        default = dict(profile["default_workload"])
+        single = dict(default)
+        single["num_images_per_prompt"] = 1
+        default_estimate = candidate_memory_estimate(profile, plan["component_precision"], plan["placement"], default)
+        single_estimate = candidate_memory_estimate(profile, plan["component_precision"], plan["placement"], single)
+        self.assertLess(single_estimate["required_total_usable_vram_gib"], default_estimate["required_total_usable_vram_gib"])
+        self.assertEqual(single["width"], default["width"])
+        self.assertEqual(single["height"], default["height"])
+
+    def test_mps_llm_uses_quantized_plan_when_native_does_not_fit(self):
+        hardware = fake_hardware("mps_llm_16", "mps", 16, [], bitsandbytes=True, vllm=False)
+        result = plan_attempts("mistralai/Mistral-7B-Instruct-v0.3", hardware=hardware)
+        self.assertEqual(result["status"], "ready")
+        first = result["attempts"][0]
+        self.assertEqual(first["execution_backend"], "mps")
+        self.assertEqual(first["component_precision"]["language_model"], "int8")
+
+
+
+    def test_mps_64_supports_all_mps_capable_image_video_profiles(self):
+        hardware = fake_hardware("mps_64_all", "mps", 64, [], bitsandbytes=True, vllm=False)
+        unsupported = []
+        for model_key, profile in MODEL_PROFILES.items():
+            if profile.get("category") not in ["image_diffusion", "image_diffusion_upscale", "video_diffusion"]:
+                continue
+            support = str(profile.get("backend_support", {}).get("mps", ""))
+            if "unsupported" in support or "not_supported" in support:
+                continue
+            if plan_attempts(model_key, hardware=hardware)["status"] != "ready":
+                unsupported.append(model_key)
+        self.assertEqual(unsupported, [])
+
+    def test_mps_reserve_scales_from_physical_unified_memory(self):
+        self.assertEqual(reserve_for_mps(8, DEFAULT_CONFIG), 1.0)
+        self.assertEqual(reserve_for_mps(32, DEFAULT_CONFIG), 3.2)
+        self.assertEqual(reserve_for_mps(192, DEFAULT_CONFIG), 8.0)
+
+    def test_video_workload_policy_preserves_resolution(self):
+        profile = get_model_profile("hunyuan_video_1_5_t2v")
+        self.assertIn("width", profile["workload_policy"]["fixed"])
+        self.assertIn("height", profile["workload_policy"]["fixed"])
+        self.assertIn("num_videos_per_prompt", profile["workload_policy"]["adjustable"])
+
+    def test_plan_history_ignores_sequential_batch_size(self):
+        validated = {"width": 1280, "height": 768, "batch_size": 1, "num_images_per_prompt": 1}
+        requested = {"width": 1280, "height": 768, "batch_size": 10, "num_images_per_prompt": 1}
+        self.assertTrue(workload_covers(validated, requested))
 
 
 if __name__ == "__main__":

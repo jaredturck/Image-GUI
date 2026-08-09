@@ -498,19 +498,22 @@ class SkyReelsV2GUI(DiffusionGUI):
             self.model_loading = True
 
         model_id = "Skywork/SkyReels-V2-DF-1.3B-540P-Diffusers"
-        vae = load_component(
-            AutoModel,
-            model_id,
-            "vae",
-            current_kwargs={"subfolder": "vae", "torch_dtype": torch.float32},
-            portable_base_kwargs={"subfolder": "vae"},
-        )
-        pipe = load_diffusers_pipeline(
-            SkyReelsV2DiffusionForcingPipeline,
-            model_id,
-            current_kwargs={"vae": vae, "torch_dtype": torch.bfloat16},
-            portable_base_kwargs={"vae": vae},
-        )
+        if "model_specific_staging" in plan_placement(self.active_plan):
+            pipe = load_diffusers_pipeline(SkyReelsV2DiffusionForcingPipeline, model_id)
+        else:
+            vae = load_component(
+                AutoModel,
+                model_id,
+                "vae",
+                current_kwargs={"subfolder": "vae", "torch_dtype": torch.float32},
+                portable_base_kwargs={"subfolder": "vae"},
+            )
+            pipe = load_diffusers_pipeline(
+                SkyReelsV2DiffusionForcingPipeline,
+                model_id,
+                current_kwargs={"vae": vae, "torch_dtype": torch.bfloat16},
+                portable_base_kwargs={"vae": vae},
+            )
         pipe.scheduler = UniPCMultistepScheduler.from_config(pipe.scheduler.config, flow_shift=self.flow_shift)
         if is_exact_fast_path(self.active_plan):
             pipe.enable_model_cpu_offload()
@@ -871,19 +874,22 @@ class AllegroGUI(DiffusionGUI):
             self.model_loading = True
 
         model_id = "rhymes-ai/Allegro"
-        vae = load_component(
-            AutoencoderKLAllegro,
-            model_id,
-            "vae",
-            current_kwargs={"subfolder": "vae", "torch_dtype": torch.float32},
-            portable_base_kwargs={"subfolder": "vae"},
-        )
-        pipe = load_diffusers_pipeline(
-            AllegroPipeline,
-            model_id,
-            current_kwargs={"vae": vae, "torch_dtype": torch.bfloat16},
-            portable_base_kwargs={"vae": vae},
-        )
+        if "model_specific_staging" in plan_placement(self.active_plan):
+            pipe = load_diffusers_pipeline(AllegroPipeline, model_id)
+        else:
+            vae = load_component(
+                AutoencoderKLAllegro,
+                model_id,
+                "vae",
+                current_kwargs={"subfolder": "vae", "torch_dtype": torch.float32},
+                portable_base_kwargs={"subfolder": "vae"},
+            )
+            pipe = load_diffusers_pipeline(
+                AllegroPipeline,
+                model_id,
+                current_kwargs={"vae": vae, "torch_dtype": torch.bfloat16},
+                portable_base_kwargs={"vae": vae},
+            )
         pipe.vae.enable_tiling()
         if is_exact_fast_path(self.active_plan):
             pipe.enable_model_cpu_offload()

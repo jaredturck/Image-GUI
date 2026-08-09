@@ -50,10 +50,11 @@ def record_attempt(entry):
 
 
 def numeric_workload(workload):
+    ignored = {"batch_size", "repeat_count"}
     return {
         key: float(value)
         for key, value in (workload or {}).items()
-        if isinstance(value, (int, float))
+        if isinstance(value, (int, float)) and key not in ignored
     }
 
 

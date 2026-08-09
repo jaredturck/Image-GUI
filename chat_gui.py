@@ -7,7 +7,7 @@ from app_config import apply_runtime_environment
 
 apply_runtime_environment()
 
-import sys, json, threading, time, gc, re, base64, queue, io, asyncio, uuid
+import sys, json, threading, time, gc, re, base64, queue, io, asyncio, uuid, subprocess
 import numpy as np
 import torch
 import sounddevice as sd
@@ -517,6 +517,10 @@ class ChatGUI:
         self.stream_t0 = 0.0
         self.stop_generation = False
 
+    def open_cachelight(self):
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        subprocess.Popen([sys.executable, os.path.join(base_dir, "cachelight.py")], cwd=base_dir)
+
     def build_ui(self):
         if self.reasoning_enabled:
             self.app.grid_columnconfigure(0, weight=1, minsize=320)
@@ -564,14 +568,17 @@ class ChatGUI:
         self.delete_btn = ctk.CTkButton(header, text="Delete", width=70, fg_color="#444444", hover_color="#3a3a3a", command=self.delete_chat)
         self.delete_btn.grid(row=0, column=2, padx=(0, 8))
 
+        cachelight_btn = ctk.CTkButton(header, text="◫", width=36, command=self.open_cachelight)
+        cachelight_btn.grid(row=0, column=3, padx=(0, 8))
+
         self.status_pill = ctk.CTkLabel(header, text="Loading...", corner_radius=999, fg_color="#333333", text_color="#d0d0d0", padx=10, pady=4)
-        self.status_pill.grid(row=0, column=3, sticky="e")
+        self.status_pill.grid(row=0, column=4, sticky="e")
 
         plan_text = self.active_plan.get("status_text", "Legacy loading path") if self.active_plan else "Legacy loading path"
         self.plan_label = ctk.CTkLabel(
             header, text=f"Plan: {plan_text}", text_color="#a8a8a8", font=ctk.CTkFont(size=11), anchor="w"
         )
-        self.plan_label.grid(row=1, column=0, columnspan=4, sticky="ew", pady=(4, 0))
+        self.plan_label.grid(row=1, column=0, columnspan=5, sticky="ew", pady=(4, 0))
 
         self.chat_view = ctk.CTkScrollableFrame(right, corner_radius=16)
         self.chat_view.grid(row=1, column=0, sticky="nsew", padx=14, pady=(0, 10))
