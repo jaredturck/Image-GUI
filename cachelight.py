@@ -17,7 +17,7 @@ from tkinter import filedialog, messagebox
 from tkinter import font as tkfont
 from tkinter import ttk
 
-from app_config import huggingface_cache_root
+from app_config import application_support_dir, huggingface_cache_root, is_packaged_macos
 
 APP_NAME = "HF Cachelight"
 APP_VERSION = "1.0.0"
@@ -1870,6 +1870,8 @@ def configure_ttk(root, fonts):
 
 
 def settings_path():
+    if is_packaged_macos():
+        return Path(application_support_dir()) / "cachelight-settings.json"
     return Path.home() / ".config" / "hf-cachelight" / "settings.json"
 
 
@@ -1894,6 +1896,7 @@ def save_settings(settings):
 
 def default_cache_path():
     candidates = [
+        Path(huggingface_cache_root()),
         Path("/mnt/8TB_HDD/hf_cache"),
         Path.home() / ".cache" / "huggingface",
     ]

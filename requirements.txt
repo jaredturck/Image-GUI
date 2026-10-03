@@ -21,4 +21,3 @@ imageio
 imageio-ffmpeg
 av
 peft
-nvidia-ml-py

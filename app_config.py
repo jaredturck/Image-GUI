@@ -7,12 +7,13 @@ from copy import deepcopy
 CONFIG_DIR_NAME = "config"
 CONFIG_FILE_NAME = "user_config.json"
 DEFAULT_MEDIA_DIR_NAME = "media"
+MACOS_SUPPORT_DIR_NAME = "Image GUI"
+PACKAGED_ENV_NAME = "IMAGE_GUI_PACKAGED"
 
 OUTPUT_DIRECTORY_MAP = {
     "z_image_turbo": ("images", "z_image_turbo"),
     "kandinsky": ("images", "kandinsky_5"),
     "pixart_sigma": ("images", "pixart_sigma"),
-    "anima": ("images", "anima"),
     "stable_diffusion3.5": ("images", "stable_diffusion_3_5"),
     "black_forest": ("images", "flux_1"),
     "glm_image": ("images", "glm_image"),
@@ -40,7 +41,6 @@ DEFAULT_CONFIG = {
     "schema_version": 1,
     "paths": {
         "huggingface_cache_dir": "",
-        "comfyui_dir": "",
         "output_root": "",
     },
     "planner": {
@@ -52,9 +52,8 @@ DEFAULT_CONFIG = {
         "budget_retry_steps_gib": [0.0, 0.5, 1.0, 2.0],
         "automatic_retry": True,
     },
-    "installer": {
-        "install_vllm": True,
-        "install_bitsandbytes": True,
+    "secrets": {
+        "chat_history_key_b64": "",
     },
 }
 
@@ -63,7 +62,17 @@ def project_dir():
     return os.path.dirname(os.path.abspath(__file__))
 
 
+def is_packaged_macos():
+    return platform.system() == "Darwin" and os.environ.get(PACKAGED_ENV_NAME) == "1"
+
+
+def application_support_dir():
+    return os.path.join(os.path.expanduser("~"), "Library", "Application Support", MACOS_SUPPORT_DIR_NAME)
+
+
 def config_dir():
+    if is_packaged_macos():
+        return application_support_dir()
     return os.path.join(project_dir(), CONFIG_DIR_NAME)
 
 
@@ -71,9 +80,23 @@ def config_path():
     return os.path.join(config_dir(), CONFIG_FILE_NAME)
 
 
+def runtime_venv_dir():
+    if is_packaged_macos():
+        return os.path.join(application_support_dir(), "venv")
+    return os.path.join(project_dir(), ".venv")
+
+
+def chat_history_path():
+    if is_packaged_macos():
+        return os.path.join(application_support_dir(), "chat_history.enc")
+    return os.path.join(project_dir(), "chat_history.enc")
+
+
 def deep_merge(base, override):
     result = deepcopy(base)
     for key, value in override.items():
+        if key not in result:
+            continue
         if isinstance(value, dict) and isinstance(result.get(key), dict):
             result[key] = deep_merge(result[key], value)
         else:
@@ -82,15 +105,15 @@ def deep_merge(base, override):
 
 
 def jared_pc_defaults():
+    if platform.system() != "Linux":
+        return {}
+
     home = os.path.expanduser("~")
     is_jared = home == "/home/jared" or os.path.isdir("/home/jared")
     defaults = {}
 
     if is_jared and os.path.isdir("/mnt/8TB_HDD"):
         defaults["huggingface_cache_dir"] = "/mnt/8TB_HDD/hf_cache"
-
-    if is_jared and os.path.isdir("/home/jared/comfy/ComfyUI"):
-        defaults["comfyui_dir"] = "/home/jared/comfy/ComfyUI"
 
     return defaults
 
@@ -133,23 +156,25 @@ def get_path(name, fallback=""):
 
 
 def huggingface_cache_root():
-    configured = get_path("huggingface_cache_dir").strip()
-    if configured:
-        return os.path.abspath(os.path.expanduser(configured))
-
-    hf_home = os.environ.get("HF_HOME", "").strip()
-    if hf_home:
-        return os.path.abspath(os.path.expanduser(hf_home))
-
     hub_cache = os.environ.get("HF_HUB_CACHE", "").strip()
     if hub_cache:
         path = os.path.abspath(os.path.expanduser(hub_cache))
         return os.path.dirname(path) if os.path.basename(path) == "hub" else path
 
+    hf_home = os.environ.get("HF_HOME", "").strip()
+    if hf_home:
+        return os.path.abspath(os.path.expanduser(hf_home))
+
+    configured = get_path("huggingface_cache_dir").strip()
+    if configured:
+        return os.path.abspath(os.path.expanduser(configured))
+
     return os.path.join(os.path.expanduser("~"), ".cache", "huggingface")
 
 
 def default_output_root():
+    if is_packaged_macos():
+        return os.path.join(os.path.expanduser("~"), "Pictures", MACOS_SUPPORT_DIR_NAME)
     return os.path.join(project_dir(), DEFAULT_MEDIA_DIR_NAME)
 
 
@@ -178,8 +203,15 @@ def resolve_output_path(relative_path):
 def apply_runtime_environment(config=None):
     config = config or load_user_config()
     cache_dir = config.get("paths", {}).get("huggingface_cache_dir", "").strip()
+    standard_cache_is_set = bool(
+        os.environ.get("HF_HUB_CACHE", "").strip() or os.environ.get("HF_HOME", "").strip()
+    )
 
-    if not cache_dir and os.environ.get("USE_HHD", "False") == "True":
+    # Explicit Hugging Face environment variables are the standard override.
+    if standard_cache_is_set:
+        cache_dir = ""
+
+    if not standard_cache_is_set and not cache_dir and os.environ.get("USE_HHD", "False") == "True":
         cache_dir = "/mnt/8TB_HDD/hf_cache"
 
     if cache_dir:
@@ -187,11 +219,10 @@ def apply_runtime_environment(config=None):
         os.makedirs(cache_dir, exist_ok=True)
         os.environ["HF_HOME"] = cache_dir
         os.environ["HF_HUB_CACHE"] = os.path.join(cache_dir, "hub")
-        os.environ["TRANSFORMERS_CACHE"] = os.path.join(cache_dir, "hub")
 
-    comfyui_dir = config.get("paths", {}).get("comfyui_dir", "").strip()
-    if comfyui_dir:
-        os.environ["AI_WORKSTATION_COMFYUI_DIR"] = os.path.abspath(os.path.expanduser(comfyui_dir))
+    chat_history_key = config.get("secrets", {}).get("chat_history_key_b64", "").strip()
+    if chat_history_key:
+        os.environ["CHAT_HISTORY_KEY_B64"] = chat_history_key
 
     os.environ["AI_WORKSTATION_CONFIG"] = config_path()
     return config

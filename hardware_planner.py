@@ -37,7 +37,7 @@ QUALITY_ORDER = {
 def normalize_precision(value):
     if value in ["int8", "8bit", "bnb_int8", "native_fp8"]:
         return "int8"
-    if value in ["int4", "4bit", "bnb_nf4", "gguf_q4_k_m", "native_mxfp4", "checkpoint_native_nf4"]:
+    if value in ["int4", "4bit", "bnb_nf4", "native_mxfp4", "checkpoint_native_nf4"]:
         return "int4"
     if value in ["checkpoint_native", "bfloat16", "float16", "float32"]:
         return "native"
@@ -102,8 +102,6 @@ def candidate_backend_allowed(candidate, profile, hardware):
     if placement == "cpu_only":
         cpu_support = str(profile.get("backend_support", {}).get("cpu", ""))
         return backend == "cpu" or bool(cpu_support), "CPU backend is unsupported"
-    if placement == "comfyui_managed":
-        return True, ""
     if placement == "vllm_tensor_parallel":
         if backend != "cuda":
             return False, "vLLM plan requires CUDA"
@@ -114,8 +112,6 @@ def candidate_backend_allowed(candidate, profile, hardware):
         return backend == "mps", "plan requires Apple MPS"
     if required_backend == "cuda_or_cpu":
         return backend in ["cuda", "cpu"], "plan requires CUDA or CPU"
-    if required_backend == "comfyui":
-        return True, ""
     if required_backend == "cuda" and backend != "cuda":
         return False, "plan requires CUDA"
     if backend == "cuda":
@@ -129,7 +125,7 @@ def exact_fast_path_matches(candidate, hardware):
     expected_backend = match.get("backend")
     if expected_backend == "cuda_or_cpu" and hardware["backend"] not in ["cuda", "cpu"]:
         return False
-    if expected_backend not in [None, "", "cuda_or_cpu", "comfyui"] and expected_backend != hardware["backend"]:
+    if expected_backend not in [None, "", "cuda_or_cpu"] and expected_backend != hardware["backend"]:
         return False
 
     gpu_count = int(match.get("gpu_count", 0))
@@ -215,7 +211,7 @@ def choose_exact_fast_path_gpus(candidate, hardware, preferred_gpu=None):
 
 def choose_gpus(candidate, hardware, preferred_gpu=None):
     placement = candidate.get("placement")
-    if placement in ["cpu_only", "mps_resident", "mps_model_specific_staging", "mps_resident_or_unified_memory", "comfyui_managed"]:
+    if placement in ["cpu_only", "mps_resident", "mps_model_specific_staging", "mps_resident_or_unified_memory"]:
         return []
     if candidate.get("template_id") == "current_exact_fast_path":
         return choose_exact_fast_path_gpus(candidate, hardware, preferred_gpu)
@@ -232,10 +228,6 @@ def choose_gpus(candidate, hardware, preferred_gpu=None):
 
 def candidate_filter(candidate, profile, hardware, preferred_gpu=None):
     placement = candidate.get("placement")
-    checkpoint_format = profile.get("checkpoint", {}).get("format")
-    if checkpoint_format == "gguf_q4_k_m" and placement not in ["existing_code_path", "vllm_tensor_parallel"]:
-        return False, "the GGUF artifact is currently implemented through the vLLM executor", []
-
     if "model_specific_staging" in str(placement) and not profile.get("placement_support", {}).get("custom_staging"):
         return False, "the model profile does not support staged execution", []
 
@@ -297,7 +289,7 @@ def budget_steps_for(candidate, config):
     placement = candidate.get("placement")
     if candidate.get("template_id") == "current_exact_fast_path":
         return [0.0]
-    if placement in ["cpu_only", "mps_resident", "mps_model_specific_staging", "mps_resident_or_unified_memory", "comfyui_managed"]:
+    if placement in ["cpu_only", "mps_resident", "mps_model_specific_staging", "mps_resident_or_unified_memory"]:
         return [0.0]
     if placement in ["single_gpu_resident"]:
         return [0.0, 0.5]
@@ -519,7 +511,7 @@ def add_backend_fallback_candidates(profile, hardware, candidates):
                 converted = mps_candidate(candidate, profile)
                 if converted is not None:
                     result.append(converted)
-                elif candidate.get("placement") in ["cpu_only", "comfyui_managed"]:
+                elif candidate.get("placement") == "cpu_only":
                     result.append(deepcopy(candidate))
         return result
 

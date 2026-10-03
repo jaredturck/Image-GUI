@@ -47,6 +47,17 @@ class PlannerTests(unittest.TestCase):
     def test_registry_is_valid(self):
         self.assertEqual(VALIDATION_ERRORS, [])
 
+    def test_removed_model_stacks_are_absent(self):
+        removed = {
+            "anima",
+            "Qwen/Qwen3-Coder-Next-GGUF:Q4_K_M",
+            "real_esrgan",
+            "realesrgan",
+        }
+        self.assertTrue(removed.isdisjoint(LAUNCHER_MODEL_IDS))
+        self.assertIsNone(get_model_profile("anima"))
+        self.assertIsNone(get_model_profile("Qwen/Qwen3-Coder-Next-GGUF:Q4_K_M"))
+
     def test_dual_24_gib_supports_every_launcher_model(self):
         hardware = fake_hardware("dual_24", "cuda", 128, [24, 24])
         unsupported = []
@@ -118,11 +129,6 @@ class PlannerTests(unittest.TestCase):
         self.assertEqual(result["status"], "ready")
         self.assertFalse(result["attempts"][0]["restore_workload"])
 
-
-    def test_vllm_native_artifact_requires_vllm(self):
-        hardware = fake_hardware("no_vllm", "cuda", 128, [24, 24], vllm=False)
-        result = plan_attempts("Qwen/Qwen3-Coder-Next-GGUF:Q4_K_M", hardware=hardware)
-        self.assertEqual(result["status"], "cannot_run")
 
     def test_vllm_model_skips_exact_path_when_vllm_is_missing(self):
         hardware = fake_hardware("no_vllm_fallback", "cuda", 128, [24, 24], vllm=False)
@@ -238,6 +244,15 @@ class PlannerTests(unittest.TestCase):
                 continue
             if plan_attempts(model_key, hardware=hardware)["status"] != "ready":
                 unsupported.append(model_key)
+        self.assertEqual(unsupported, [])
+
+    def test_mps_64_has_a_plan_for_every_retained_launcher_model(self):
+        hardware = fake_hardware("mps_64_catalogue", "mps", 64, [], bitsandbytes=True, vllm=False)
+        unsupported = [
+            model_reference
+            for model_reference in LAUNCHER_MODEL_IDS
+            if plan_attempts(model_reference, hardware=hardware)["status"] != "ready"
+        ]
         self.assertEqual(unsupported, [])
 
     def test_mps_reserve_scales_from_physical_unified_memory(self):

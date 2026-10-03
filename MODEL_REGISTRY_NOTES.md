@@ -21,7 +21,7 @@ Component weight estimates distinguish native, INT8, and INT4 storage. Quantized
 - Large text encoders may use more aggressive quantization than image or video denoisers.
 - VAEs, schedulers, tokenizers, processors, and small text encoders remain at native precision unless a model-specific native artifact says otherwise.
 - Sensitive embeddings, normalization, modulation, input projections, output projections, and language-model heads are protected where the implementation supports skip lists.
-- Native FP8, MXFP4, GGUF, or publisher-supplied low-bit checkpoints are treated as intended artifacts rather than generic dynamic quantization.
+- Native FP8, MXFP4, or publisher-supplied low-bit checkpoints are treated as intended artifacts rather than generic dynamic quantization.
 
 ## Existing and portable loaders
 

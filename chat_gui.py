@@ -3,7 +3,7 @@ import dotenv
 
 dotenv.load_dotenv()
 
-from app_config import apply_runtime_environment
+from app_config import apply_runtime_environment, chat_history_path
 
 apply_runtime_environment()
 
@@ -40,7 +40,6 @@ def get_flag_value(flag):
     return None
 
 GEMMA_4_MODEL_ID = "google/gemma-4-31B-it"
-QWEN3_CODER_GGUF_MODEL_ID = "Qwen/Qwen3-Coder-Next-GGUF:Q4_K_M"
 
 CHAT_MODEL_QUANTIZATION = {
     GEMMA_4_MODEL_ID: "8bit",
@@ -60,18 +59,6 @@ VLLM_MODEL_CONFIGS = {
         "dtype": "float16",
         "gpu_memory_utilization": 0.90,
         "max_model_len": 8192,
-        "language_model_only": True,
-        "enforce_eager": True,
-        "disable_log_stats": True,
-    },
-    QWEN3_CODER_GGUF_MODEL_ID: {
-        "tokenizer": "Qwen/Qwen3-Coder-Next",
-        "hf_config_path": "Qwen/Qwen3-Coder-Next",
-        "load_format": "gguf",
-        "tensor_parallel_size": 2,
-        "dtype": "float16",
-        "gpu_memory_utilization": 0.99,
-        "max_model_len": 4096,
         "language_model_only": True,
         "enforce_eager": True,
         "disable_log_stats": True,
@@ -96,7 +83,6 @@ REASONING_MODEL_IDS = {
     "Qwen/Qwen3.6-27B",
     GEMMA_4_MODEL_ID,
     "Qwen/Qwen3.6-35B-A3B-FP8",
-    QWEN3_CODER_GGUF_MODEL_ID,
 }
 
 REASONING_SUMMARY_MODEL_ID = "Qwen/Qwen2.5-0.5B-Instruct"
@@ -142,7 +128,7 @@ class ChatGUI:
 
         self.model_id = model_id or "unknown-model"
         self.base_dir = os.path.dirname(os.path.abspath(__file__))
-        self.store_path = os.path.join(self.base_dir, "chat_history.enc")
+        self.store_path = chat_history_path()
 
         self.model_lock = threading.Lock()
         self.model_loading = False

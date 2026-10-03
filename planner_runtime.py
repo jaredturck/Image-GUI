@@ -282,7 +282,7 @@ def plan_max_memory(plan=None):
 def normalize_precision(value):
     if value in ["int8", "8bit", "bnb_int8", "native_fp8"]:
         return "int8"
-    if value in ["int4", "4bit", "bnb_nf4", "gguf_q4_k_m", "native_mxfp4", "checkpoint_native_nf4"]:
+    if value in ["int4", "4bit", "bnb_nf4", "native_mxfp4", "checkpoint_native_nf4"]:
         return "int4"
     if value in ["checkpoint_native", "bfloat16", "float16", "float32"]:
         return "native"

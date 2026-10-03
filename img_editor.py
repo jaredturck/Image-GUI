@@ -7,6 +7,7 @@ import subprocess
 import cv2
 import numpy as np
 import customtkinter as ctk
+from platform_utils import open_path
 from tkinter import filedialog
 from PIL import Image, ImageOps
 
@@ -739,7 +740,7 @@ class ImageEditorGUI:
             return
 
         os.makedirs(folder, exist_ok=True)
-        subprocess.Popen(["xdg-open", folder])
+        open_path(folder)
 
     def parse_resolution(self, resolution):
         width, height = resolution.split("x")

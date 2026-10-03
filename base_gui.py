@@ -12,11 +12,9 @@ import customtkinter as ctk
 from tkinter import filedialog
 from PIL import Image
 from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
-from pynvml import nvmlInit, nvmlDeviceGetCount, nvmlDeviceGetHandleByIndex, nvmlDeviceGetUtilizationRates
-from pynvml import nvmlDeviceGetCurrentClocksThrottleReasons
-from pynvml import nvmlClocksThrottleReasonHwThermalSlowdown, nvmlClocksThrottleReasonSwThermalSlowdown
 import io, shutil, subprocess
 from planner_runtime import clear_accelerator_cache, get_active_plan, is_exact_fast_path, mark_success, preview_device, run_guarded, workload_from_diffusion_gui
+from platform_utils import ffmpeg_executable, open_path
 
 class DiffusionGUI:
 
@@ -75,8 +73,6 @@ class DiffusionGUI:
         self.cleanup_requested = False
         self.image_refs = []
         self.preview_time = time.time()
-        self.backend = hasattr(self, 'backend') and self.backend or "diffusers"
-        self.comfy_nodes = None
         self.active_seed = None
         self.active_plan = get_active_plan()
         if self.active_plan and not is_exact_fast_path(self.active_plan):
@@ -148,10 +144,17 @@ class DiffusionGUI:
         self.thermal_poll_id = None
 
         self.gpu_handles = []
+        self.nvml = None
         if torch.cuda.is_available():
             try:
-                nvmlInit()
-                self.gpu_handles = [nvmlDeviceGetHandleByIndex(i) for i in range(nvmlDeviceGetCount())]
+                import pynvml
+
+                pynvml.nvmlInit()
+                self.nvml = pynvml
+                self.gpu_handles = [
+                    pynvml.nvmlDeviceGetHandleByIndex(i)
+                    for i in range(pynvml.nvmlDeviceGetCount())
+                ]
             except Exception as error:
                 print(f"NVML unavailable: {error}")
 
@@ -256,14 +259,14 @@ class DiffusionGUI:
         return best.strip()
     
     def on_gallery_item_double_click(self, event, path):
-        subprocess.Popen(["xdg-open", path])
+        open_path(path)
     
     def clear_cuda_cache(self):
         clear_accelerator_cache()
     
     def open_output_folder(self):
         os.makedirs(self.image_folder, exist_ok=True)
-        subprocess.Popen(["xdg-open", os.path.abspath(self.image_folder)])
+        open_path(self.image_folder)
     
     def open_cachelight(self):
         base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -292,11 +295,9 @@ class DiffusionGUI:
         with self.model_lock:
             pipe = self.pipe
             vae = self.preview_vae
-            comfy_nodes = self.comfy_nodes
 
             self.pipe = None
             self.preview_vae = None
-            self.comfy_nodes = None
             self.model_loading = False
 
         with self.prompt_model_lock:
@@ -317,23 +318,9 @@ class DiffusionGUI:
             pipe.close()
         if pipe is not None:
             del pipe
-        if comfy_nodes is not None:
-            del comfy_nodes
-
         self.clear_cuda_cache()
 
     def ensure_model_loaded(self):
-        if self.backend == "comfy":
-            if self.pipe is not None and self.preview_vae is not None and self.comfy_nodes is not None:
-                return
-
-            if self.model_loading:
-                while self.model_loading and (self.pipe is None or self.preview_vae is None or self.comfy_nodes is None):
-                    time.sleep(0.2)
-                return
-
-            return self.load_model_guarded()
-
         if self.pipe is not None:
             return
 
@@ -564,16 +551,23 @@ class DiffusionGUI:
         return x
     
     def get_gpu_percent(self):
+        if self.nvml is None:
+            return 0
         vals = []
         for handle in self.gpu_handles:
-            vals.append(nvmlDeviceGetUtilizationRates(handle).gpu)
+            vals.append(self.nvml.nvmlDeviceGetUtilizationRates(handle).gpu)
         return max(vals) if vals else 0
     
     def get_thermal_throttling(self):
-        thermal_reasons = nvmlClocksThrottleReasonHwThermalSlowdown | nvmlClocksThrottleReasonSwThermalSlowdown
+        if self.nvml is None:
+            return False
+        thermal_reasons = (
+            self.nvml.nvmlClocksThrottleReasonHwThermalSlowdown
+            | self.nvml.nvmlClocksThrottleReasonSwThermalSlowdown
+        )
 
         for handle in self.gpu_handles:
-            reasons = nvmlDeviceGetCurrentClocksThrottleReasons(handle)
+            reasons = self.nvml.nvmlDeviceGetCurrentClocksThrottleReasons(handle)
             if reasons & thermal_reasons:
                 return True
 
@@ -649,7 +643,7 @@ class DiffusionGUI:
             canvas.yview_scroll(-1 if delta > 0 else 1, "units")
     
     def load_video_thumb(self, path):
-        ffmpeg = shutil.which("ffmpeg")
+        ffmpeg = ffmpeg_executable()
         if not ffmpeg:
             return None
 
@@ -686,7 +680,7 @@ class DiffusionGUI:
         data = {
             "saved_at_unix": time.time(),
             "saved_at_local": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "backend": self.backend,
+            "backend": "diffusers",
             "image_folder": self.image_folder,
             "prompt": self.prompt,
             "negative_prompt": self.negative_prompt,
@@ -1422,56 +1416,6 @@ class DiffusionGUI:
 
         return w, h
     
-    def generate_comfy(self):
-        if self.backend == "comfy":
-            from comfy_script.runtime import Workflow, util
-
-            with self.model_lock:
-                nodes = self.comfy_nodes
-                model, clip = self.pipe
-                vae = self.preview_vae
-
-            stopped = False
-
-            for i in range(self.batch_size):
-                if self.stop_requested:
-                    stopped = True
-                    break
-
-                self.progress_total = self.batch_size
-                self.progress_step = i
-                self.progress = self.progress_step / self.progress_total
-                self.app.after(0, self.update_progress_widgets)
-
-                seed = random.randrange(1, 2**63)
-
-                with Workflow(wait=True):
-                    pos = nodes.CLIPTextEncode(self.prompt, clip)
-                    neg = nodes.CLIPTextEncode(self.negative_prompt, clip)
-                    latent = nodes.EmptyLatentImage(self.width, self.height, self.num_images_per_prompt)
-                    samples = nodes.KSampler(model, seed, self.num_inference_steps, self.guidance_scale, "er_sde", "normal", pos, neg, latent, 1.0)
-                    images = util.get_images(nodes.VAEDecode(samples, vae))
-
-                if images:
-                    self.app.after(0, self.set_preview_image, images[0].copy())
-
-                for idx, img in enumerate(images):
-                    fname = f"output_{int(time.time())}{idx}.png"
-                    output_path = os.path.join(self.image_folder, fname)
-                    img.save(output_path)
-                    print(f"saved {fname}")
-
-                self.progress_step = i + 1
-                self.progress = self.progress_step / self.progress_total
-                self.app.after(0, self.update_progress_widgets)
-
-            if not stopped:
-                self.progress = 1.0
-                self.progress_step = self.progress_total
-                self.app.after(0, self.update_progress_widgets)
-
-            return self.app.after(0, self.finish_generate)
-    
     def generate_diffusers(self):
         stopped = False
         for i in range(self.batch_size):
@@ -1549,7 +1493,4 @@ class DiffusionGUI:
         self.sync_params()
         self.ensure_model_loaded()
 
-        if self.backend == "comfy":
-            return self.generate_comfy()
-        else:
-            return self.generate_diffusers()
+        return self.generate_diffusers()

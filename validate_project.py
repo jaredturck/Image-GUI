@@ -1,15 +1,20 @@
-import compileall
 import os
+import py_compile
 import sys
 import unittest
+from pathlib import Path
 
 from model_registry import MODEL_PROFILES, VALIDATION_ERRORS
 
 
 def main():
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    compiled = compileall.compile_dir(base_dir, quiet=1)
-    if not compiled:
+    base_dir = Path(__file__).resolve().parent
+    source_files = list(base_dir.glob("*.py")) + list((base_dir / "tests").glob("*.py"))
+    try:
+        for source_file in source_files:
+            py_compile.compile(source_file, doraise=True)
+    except py_compile.PyCompileError as error:
+        print(error)
         print("Python compilation failed.")
         return 1
 

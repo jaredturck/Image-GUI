@@ -66,22 +66,6 @@ QUANTIZATION_METHODS = {
         'description': 'Model-native microscaling FP4 expert representation with sensitive modules retained at higher precision.',
         'default_quality_risk': 'low',
         'planner_role': 'native_representation_not_a_fallback'
-    },
-    'gguf_q4_k_m': {
-        'backend': 'gguf',
-        'weight_bits': 4,
-        'activation_bits': 'backend_dependent',
-        'description': 'GGUF Q4_K_M mixed-block quantized checkpoint.',
-        'default_quality_risk': 'medium',
-        'planner_role': 'native_artifact'
-    },
-    'comfy_checkpoint_native': {
-        'backend': 'comfyui',
-        'weight_bits': 'checkpoint_defined',
-        'activation_bits': 'runtime_defined',
-        'description': 'ComfyUI single-file checkpoint loaded according to its stored tensor types.',
-        'default_quality_risk': 'checkpoint_defined',
-        'planner_role': 'native_artifact'
     }
 }
 
@@ -305,13 +289,6 @@ PLAN_TEMPLATES = {
         'quality_class': 'native',
         'minimum_gpu_count': 0
     },
-    'comfy_native': {
-        'placement': 'comfyui_managed',
-        'quantization_mode': 'checkpoint_native',
-        'speed_class': 'hardware_dependent',
-        'quality_class': 'checkpoint_native',
-        'minimum_gpu_count': 0
-    },
     'vllm_native': {
         'placement': 'vllm_tensor_parallel',
         'quantization_mode': 'checkpoint_native',
@@ -336,7 +313,6 @@ LAUNCHER_MODEL_IDS = [
     'z_image_turbo',
     'kandinsky_5',
     'pixart_sigma',
-    'anima',
     'stable_diffusion_3_5',
     'flux_1',
     'glm_image',
@@ -380,8 +356,7 @@ LAUNCHER_MODEL_IDS = [
     'deepseek-ai/DeepSeek-R1-Distill-Qwen-32B',
     'Qwen/Qwen3.6-27B',
     'google/gemma-4-31B-it',
-    'Qwen/Qwen3.6-35B-A3B',
-    'Qwen/Qwen3-Coder-Next-GGUF:Q4_K_M'
+    'Qwen/Qwen3.6-35B-A3B'
 ]
 
 RAW_MODEL_PROFILES = [
@@ -3333,136 +3308,6 @@ RAW_MODEL_PROFILES = [
         'application_source_files': ['chat_gui.py']
     },
     {
-        'key': 'qwen3_coder_next_gguf',
-        'model_id': 'Qwen/Qwen3-Coder-Next-GGUF:Q4_K_M',
-        'runtime_model_id': 'Qwen/Qwen3-Coder-Next-GGUF:Q4_K_M',
-        'launcher_id': 'Qwen/Qwen3-Coder-Next-GGUF:Q4_K_M',
-        'display_name': 'Qwen3 Coder Next 80B Q4_K_M',
-        'category': 'llm',
-        'task': 'code_reasoning',
-        'checkpoint': {'format': 'gguf_q4_k_m', 'native_dtype': 'bfloat16', 'already_quantized': True},
-        'architecture': {
-            'family': 'qwen3_coder_next_moe',
-            'parameter_billions': 80.0,
-            'active_parameter_billions': 3.0,
-            'hidden_size': 2048,
-            'intermediate_size': 5120,
-            'num_hidden_layers': 48,
-            'num_attention_heads': 16,
-            'num_key_value_heads': 2,
-            'head_dim': 256,
-            'max_context_tokens': 262144,
-            'vocab_size': 151936,
-            'uses_kv_cache': True,
-            'cache_dtype': 'bfloat16'
-        },
-        'components': {
-            'language_model': {
-                'role': 'llm_decoder',
-                'architecture': 'qwen3_coder_next_moe',
-                'parameter_billions': 80.0,
-                'active_parameter_billions': 3.0,
-                'native_dtype': 'bfloat16',
-                'quantizable_fraction': 0.93,
-                'checkpoint_storage_gib': 0.0,
-                'checkpoint_storage_basis': 'repository_file_inventory',
-                'phases': ['prefill', 'decode'],
-                'sharding': 'decoder_block_sharding_and_automatic_device_map',
-                'offload': 'device_map_cpu_overflow_or_cpu_execution',
-                'quantization_support': {'int8': 'artifact_defined', 'int4': 'artifact_defined'},
-                'skip_modules': ['model.embed_tokens', 'lm_head', 'normalization_layers'],
-                'memory_overrides_gib': {},
-                'confidence': 'high',
-                'evidence': 'published_configuration_and_parameter_class',
-                'notes': []
-            }
-        },
-        'execution_phases': [
-            {
-                'name': 'prefill',
-                'required_components': ['language_model'],
-                'dynamic_memory_scales_with': ['batch_size', 'padded_prompt_tokens', 'attention_backend']
-            },
-            {
-                'name': 'decode',
-                'required_components': ['language_model'],
-                'dynamic_memory_scales_with': ['batch_size', 'cached_tokens', 'generated_tokens']
-            }
-        ],
-        'default_workload': {'batch_size': 1, 'prompt_tokens': 4096, 'max_new_tokens': 4096},
-        'runtime_memory': {
-            'dominant_terms': [
-                'weights',
-                'kv_cache',
-                'prefill_mlp_activations',
-                'attention_workspace',
-                'quantization_temporaries'
-            ],
-            'kv_cache_formula_bytes': '2 * batch * cached_tokens * layers * kv_heads * head_dim * cache_dtype_bytes',
-            'prefill_risk': 'high',
-            'decode_risk': 'medium',
-            'default_runtime_headroom_gib': 4.0
-        },
-        'backend_support': {
-            'cuda': 'supported',
-            'mps': 'supported_with_transformers_operator_and_memory_limits',
-            'cpu': 'supported',
-            'cpu_practicality': 'usable',
-            'bitsandbytes_cuda': False,
-            'vllm': True
-        },
-        'placement_support': {
-            'single_gpu': True,
-            'multi_gpu_device_map': False,
-            'decoder_block_sharding': False,
-            'cpu_overflow_device_map': False,
-            'cpu_only': True,
-            'sequential_cpu_offload': False
-        },
-        'quantization_policy': {
-            'int8_auto_allowed': False,
-            'int8_quality_risk': 'low',
-            'int4_auto_allowed': True,
-            'int4_quality_risk': 'medium_for_native_gguf',
-            'int4_priority': 'native_artifact',
-            'minimum_automatic_bits': 4,
-            'reasoning_or_precision_sensitive': True,
-            'keep_high_precision': ['embeddings', 'normalization', 'lm_head']
-        },
-        'current_code': {
-            'loader': 'vllm_async_engine',
-            'quantization': 'gguf_q4_k_m',
-            'plan': 'tensor_parallel_2_gpu_gguf'
-        },
-        'existing_fast_path': {
-            'plan_id': 'qwen3_coder_next_gguf_current_application_path',
-            'hardware_match': {'backend': 'cuda', 'gpu_count': 2, 'minimum_total_vram_gib_each': 24},
-            'loader': 'vllm_async_engine',
-            'placement': 'tensor_parallel_2_gpu_gguf',
-            'quantization': {'language_model': 'gguf_q4_k_m'},
-            'max_memory_gib': {},
-            'preserve_exact_loader': True
-        },
-        'sources': [
-            'https://huggingface.co/Qwen/Qwen3-Coder-Next',
-            'https://huggingface.co/Qwen/Qwen3-Coder-Next/blob/main/config.json',
-            'https://huggingface.co/Qwen/Qwen3-Coder-Next/tree/main',
-            'https://huggingface.co/Qwen/Qwen3-Coder-Next-GGUF'
-        ],
-        'confidence': {
-            'architecture': 'high',
-            'weight_memory': 'high',
-            'runtime_peak': 'estimated',
-            'quantization_quality': 'policy_and_research_inference'
-        },
-        'notes': [
-            'The application selects the Q4_K_M GGUF artifact and uses the unquantized repository for tokenizer and configuration metadata.'
-        ],
-        'tokenizer_model_id': 'Qwen/Qwen3-Coder-Next',
-        'config_model_id': 'Qwen/Qwen3-Coder-Next',
-        'application_source_files': ['chat_gui.py']
-    },
-    {
         'key': 'qwen2_5_0_5b_auxiliary',
         'model_id': 'Qwen/Qwen2.5-0.5B-Instruct',
         'runtime_model_id': 'Qwen/Qwen2.5-0.5B-Instruct',
@@ -3711,8 +3556,7 @@ RAW_MODEL_PROFILES = [
             'cuda': 'supported',
             'mps': 'pipeline_dependent_and_unverified',
             'cpu': 'supported_but_task_may_be_impractical',
-            'bitsandbytes_cuda': True,
-            'comfyui': False
+            'bitsandbytes_cuda': True
         },
         'placement_support': {
             'single_gpu': True,
@@ -3901,8 +3745,7 @@ RAW_MODEL_PROFILES = [
             'cuda': 'supported',
             'mps': 'pipeline_dependent_and_unverified',
             'cpu': 'supported_but_task_may_be_impractical',
-            'bitsandbytes_cuda': True,
-            'comfyui': False
+            'bitsandbytes_cuda': True
         },
         'placement_support': {
             'single_gpu': True,
@@ -4071,8 +3914,7 @@ RAW_MODEL_PROFILES = [
             'cuda': 'supported',
             'mps': 'pipeline_dependent_and_unverified',
             'cpu': 'supported_but_task_may_be_impractical',
-            'bitsandbytes_cuda': True,
-            'comfyui': False
+            'bitsandbytes_cuda': True
         },
         'placement_support': {
             'single_gpu': True,
@@ -4118,181 +3960,6 @@ RAW_MODEL_PROFILES = [
             'quantization_quality': 'research_policy_and_model_specific_evidence'
         },
         'notes': [],
-        'application_source_files': ['model_gui.py']
-    },
-    {
-        'key': 'anima',
-        'model_id': 'local/Anima-ComfyUI',
-        'runtime_model_id': 'local/Anima-ComfyUI',
-        'launcher_id': 'anima',
-        'display_name': 'Anima',
-        'category': 'image_diffusion',
-        'task': 'image_text_to_image',
-        'checkpoint': {
-            'format': 'comfy_checkpoint_native',
-            'native_dtype': 'bfloat16_or_component_specific',
-            'already_quantized': True
-        },
-        'architecture': {'family': 'comfyui_anima_preview_workflow', 'component_count': 3},
-        'components': {
-            'text_encoder': {
-                'role': 'large_text_encoder',
-                'architecture': 'qwen3_0_6b_comfy_text_encoder',
-                'parameter_billions': 0.6,
-                'active_parameter_billions': 0.6,
-                'native_dtype': 'bfloat16',
-                'quantizable_fraction': 0.9,
-                'checkpoint_storage_gib': 1.11,
-                'checkpoint_storage_basis': 'repository_file_inventory',
-                'phases': ['text_encoding'],
-                'sharding': 'comfyui_managed',
-                'offload': 'comfyui_managed',
-                'quantization_support': {
-                    'int8': 'checkpoint_or_comfy_runtime_defined',
-                    'int4': 'avoid_for_small_encoder'
-                },
-                'skip_modules': [],
-                'memory_overrides_gib': {},
-                'confidence': 'medium',
-                'evidence': 'filename_and_public_qwen3_0_6b_artifact_size',
-                'notes': []
-            },
-            'transformer': {
-                'role': 'image_dit',
-                'architecture': 'anima_preview_dit',
-                'parameter_billions': 2.0,
-                'active_parameter_billions': 2.0,
-                'native_dtype': 'bfloat16',
-                'quantizable_fraction': 0.9,
-                'checkpoint_storage_gib': 3.8,
-                'checkpoint_storage_basis': 'repository_file_inventory',
-                'phases': ['denoising'],
-                'sharding': 'comfyui_managed',
-                'offload': 'comfyui_managed',
-                'quantization_support': {'int8': 'comfyui_runtime_defined', 'int4': 'checkpoint_defined'},
-                'skip_modules': [],
-                'memory_overrides_gib': {},
-                'confidence': 'medium',
-                'evidence': 'launcher_parameter_label_and_local_checkpoint_name',
-                'notes': []
-            },
-            'vae': {
-                'role': 'vae',
-                'architecture': 'qwen_image_vae',
-                'parameter_billions': 0.127,
-                'active_parameter_billions': 0.127,
-                'native_dtype': 'bfloat16',
-                'quantizable_fraction': 0.02,
-                'checkpoint_storage_gib': 0.24,
-                'checkpoint_storage_basis': 'repository_file_inventory',
-                'phases': ['vae_decode'],
-                'sharding': 'comfyui_managed',
-                'offload': 'comfyui_managed',
-                'quantization_support': {'int8': 'disabled', 'int4': 'disabled'},
-                'skip_modules': [],
-                'memory_overrides_gib': {},
-                'confidence': 'high',
-                'evidence': 'architecture_and_checkpoint_metadata',
-                'notes': []
-            }
-        },
-        'execution_phases': [
-            {
-                'name': 'text_encoding',
-                'required_components': ['text_encoder'],
-                'releasable_after': [],
-                'output_can_move_to_cpu': False,
-                'dynamic_memory_scales_with': ['prompt_tokens', 'batch_size']
-            },
-            {
-                'name': 'denoising',
-                'required_components': ['transformer'],
-                'releasable_after': [],
-                'dynamic_memory_scales_with': ['width', 'height', 'batch_size', 'guidance']
-            },
-            {
-                'name': 'vae_decode',
-                'required_components': ['vae'],
-                'dynamic_memory_scales_with': ['width', 'height', 'batch_size']
-            }
-        ],
-        'default_workload': {
-            'width': 1280,
-            'height': 768,
-            'batch_size': 3,
-            'inference_steps': 40,
-            'prompt_tokens': 512
-        },
-        'runtime_memory': {
-            'dominant_terms': [
-                'denoiser_weights',
-                'denoiser_activations',
-                'attention_workspace',
-                'latents',
-                'vae_encode_decode_activations'
-            ],
-            'default_runtime_headroom_gib': 4.0,
-            'workload_scaling': ['width', 'height', 'batch_size'],
-            'weight_quantization_does_not_reduce': [
-                'latents',
-                'attention_workspace',
-                'vae_activations',
-                'most_non_linear_activations'
-            ]
-        },
-        'backend_support': {
-            'cuda': 'comfyui_supported',
-            'mps': 'comfyui_installation_dependent',
-            'cpu': 'comfyui_installation_dependent',
-            'bitsandbytes_cuda': False,
-            'comfyui': True
-        },
-        'placement_support': {
-            'single_gpu': True,
-            'multi_gpu_component_placement': False,
-            'multi_gpu_block_sharding': False,
-            'device_map': False,
-            'model_cpu_offload': False,
-            'sequential_cpu_offload': False,
-            'custom_staging': False,
-            'cpu_only': True
-        },
-        'quantization_policy': {
-            'component_specific': True,
-            'int8_auto_allowed': False,
-            'int4_auto_allowed': False,
-            'int4_default_position': 'after_int8_and_native_model_offload',
-            'never_quantize_roles': ['vae', 'scheduler', 'tokenizer', 'processor'],
-            'prefer_text_encoder_int4_over_denoiser_int4': True,
-            'prefer_resident_int8_over_native_sequential_offload': True
-        },
-        'current_code': {
-            'loader': 'ComfyUI_UNETLoader_CLIPLoader_VAELoader',
-            'plan': 'comfyui_managed_native_checkpoints',
-            'quantization': 'checkpoint_native'
-        },
-        'existing_fast_path': {
-            'plan_id': 'anima_current_comfyui_local_workflow',
-            'hardware_match': {'backend': 'comfyui', 'gpu_count': 0},
-            'loader': 'ComfyUI_UNETLoader_CLIPLoader_VAELoader',
-            'placement': 'comfyui_managed',
-            'artifacts': ['anima-preview.safetensors', 'qwen_3_06b_base.safetensors', 'qwen_image_vae.safetensors'],
-            'preserve_exact_loader': True
-        },
-        'sources': [
-            'https://github.com/comfyanonymous/ComfyUI',
-            'https://huggingface.co/Qwen/Qwen3-0.6B',
-            'https://huggingface.co/Qwen/Qwen-Image/tree/main/vae'
-        ],
-        'confidence': {
-            'architecture': 'medium',
-            'component_weight_memory': 'medium',
-            'runtime_peak': 'estimated',
-            'quantization_quality': 'research_policy_and_model_specific_evidence'
-        },
-        'notes': [
-            'The exact Anima preview checkpoint is local to the configured ComfyUI installation. The registry uses the launcher 2B label and public supporting checkpoint sizes rather than leaving the profile empty.'
-        ],
         'application_source_files': ['model_gui.py']
     },
     {
@@ -4457,8 +4124,7 @@ RAW_MODEL_PROFILES = [
             'cuda': 'supported',
             'mps': 'pipeline_dependent_and_unverified',
             'cpu': 'supported_but_task_may_be_impractical',
-            'bitsandbytes_cuda': True,
-            'comfyui': False
+            'bitsandbytes_cuda': True
         },
         'placement_support': {
             'single_gpu': True,
@@ -4649,8 +4315,7 @@ RAW_MODEL_PROFILES = [
             'cuda': 'supported',
             'mps': 'pipeline_dependent_and_unverified',
             'cpu': 'supported_but_task_may_be_impractical',
-            'bitsandbytes_cuda': True,
-            'comfyui': False
+            'bitsandbytes_cuda': True
         },
         'placement_support': {
             'single_gpu': True,
@@ -4846,8 +4511,7 @@ RAW_MODEL_PROFILES = [
             'cuda': 'supported',
             'mps': 'pipeline_dependent_and_unverified',
             'cpu': 'supported_but_task_may_be_impractical',
-            'bitsandbytes_cuda': True,
-            'comfyui': False
+            'bitsandbytes_cuda': True
         },
         'placement_support': {
             'single_gpu': True,
@@ -5025,8 +4689,7 @@ RAW_MODEL_PROFILES = [
             'cuda': 'supported',
             'mps': 'pipeline_dependent_and_unverified',
             'cpu': 'supported_but_task_may_be_impractical',
-            'bitsandbytes_cuda': True,
-            'comfyui': False
+            'bitsandbytes_cuda': True
         },
         'placement_support': {
             'single_gpu': True,
@@ -5214,8 +4877,7 @@ RAW_MODEL_PROFILES = [
             'cuda': 'supported',
             'mps': 'pipeline_dependent_and_unverified',
             'cpu': 'supported_but_task_may_be_impractical',
-            'bitsandbytes_cuda': True,
-            'comfyui': False
+            'bitsandbytes_cuda': True
         },
         'placement_support': {
             'single_gpu': True,
@@ -5417,8 +5079,7 @@ RAW_MODEL_PROFILES = [
             'cuda': 'supported',
             'mps': 'pipeline_dependent_and_unverified',
             'cpu': 'supported_but_task_may_be_impractical',
-            'bitsandbytes_cuda': True,
-            'comfyui': False
+            'bitsandbytes_cuda': True
         },
         'placement_support': {
             'single_gpu': True,
@@ -5603,8 +5264,7 @@ RAW_MODEL_PROFILES = [
             'cuda': 'supported',
             'mps': 'pipeline_dependent_and_unverified',
             'cpu': 'supported_but_task_may_be_impractical',
-            'bitsandbytes_cuda': True,
-            'comfyui': False
+            'bitsandbytes_cuda': True
         },
         'placement_support': {
             'single_gpu': True,
@@ -5791,8 +5451,7 @@ RAW_MODEL_PROFILES = [
             'cuda': 'supported',
             'mps': 'pipeline_dependent_and_unverified',
             'cpu': 'supported_but_task_may_be_impractical',
-            'bitsandbytes_cuda': True,
-            'comfyui': False
+            'bitsandbytes_cuda': True
         },
         'placement_support': {
             'single_gpu': True,
@@ -5914,8 +5573,7 @@ RAW_MODEL_PROFILES = [
             'cuda': 'supported',
             'mps': 'likely_supported_but_remote_code_dependent',
             'cpu': 'practical',
-            'bitsandbytes_cuda': False,
-            'comfyui': False
+            'bitsandbytes_cuda': False
         },
         'placement_support': {
             'single_gpu': True,
@@ -6084,8 +5742,7 @@ RAW_MODEL_PROFILES = [
             'cuda': 'supported',
             'mps': 'pipeline_dependent_and_unverified',
             'cpu': 'supported_but_task_may_be_impractical',
-            'bitsandbytes_cuda': True,
-            'comfyui': False
+            'bitsandbytes_cuda': True
         },
         'placement_support': {
             'single_gpu': True,
@@ -6261,8 +5918,7 @@ RAW_MODEL_PROFILES = [
             'cuda': 'supported',
             'mps': 'pipeline_dependent_and_unverified',
             'cpu': 'supported_but_task_may_be_impractical',
-            'bitsandbytes_cuda': True,
-            'comfyui': False
+            'bitsandbytes_cuda': True
         },
         'placement_support': {
             'single_gpu': True,
@@ -6460,8 +6116,7 @@ RAW_MODEL_PROFILES = [
             'cuda': 'supported',
             'mps': 'pipeline_dependent_and_unverified',
             'cpu': 'supported_but_task_may_be_impractical',
-            'bitsandbytes_cuda': True,
-            'comfyui': False
+            'bitsandbytes_cuda': True
         },
         'placement_support': {
             'single_gpu': True,
@@ -6645,8 +6300,7 @@ RAW_MODEL_PROFILES = [
             'cuda': 'supported',
             'mps': 'pipeline_dependent_and_unverified',
             'cpu': 'supported_but_task_may_be_impractical',
-            'bitsandbytes_cuda': True,
-            'comfyui': False
+            'bitsandbytes_cuda': True
         },
         'placement_support': {
             'single_gpu': True,
@@ -6823,8 +6477,7 @@ RAW_MODEL_PROFILES = [
             'cuda': 'supported',
             'mps': 'pipeline_dependent_and_unverified',
             'cpu': 'supported_but_task_may_be_impractical',
-            'bitsandbytes_cuda': True,
-            'comfyui': False
+            'bitsandbytes_cuda': True
         },
         'placement_support': {
             'single_gpu': True,
@@ -7007,8 +6660,7 @@ RAW_MODEL_PROFILES = [
             'cuda': 'supported',
             'mps': 'pipeline_dependent_and_unverified',
             'cpu': 'supported_but_task_may_be_impractical',
-            'bitsandbytes_cuda': True,
-            'comfyui': False
+            'bitsandbytes_cuda': True
         },
         'placement_support': {
             'single_gpu': True,
@@ -7212,8 +6864,7 @@ RAW_MODEL_PROFILES = [
             'cuda': 'supported',
             'mps': 'pipeline_dependent_and_unverified',
             'cpu': 'supported_but_task_may_be_impractical',
-            'bitsandbytes_cuda': True,
-            'comfyui': False
+            'bitsandbytes_cuda': True
         },
         'placement_support': {
             'single_gpu': True,
@@ -7434,8 +7085,7 @@ RAW_MODEL_PROFILES = [
             'cuda': 'supported',
             'mps': 'pipeline_dependent_and_unverified',
             'cpu': 'supported_but_task_may_be_impractical',
-            'bitsandbytes_cuda': True,
-            'comfyui': False
+            'bitsandbytes_cuda': True
         },
         'placement_support': {
             'single_gpu': True,
@@ -7638,8 +7288,7 @@ RAW_MODEL_PROFILES = [
             'cuda': 'supported',
             'mps': 'pipeline_dependent_and_unverified',
             'cpu': 'supported_but_task_may_be_impractical',
-            'bitsandbytes_cuda': True,
-            'comfyui': False
+            'bitsandbytes_cuda': True
         },
         'placement_support': {
             'single_gpu': True,
@@ -7844,8 +7493,7 @@ RAW_MODEL_PROFILES = [
             'cuda': 'supported',
             'mps': 'pipeline_dependent_and_unverified',
             'cpu': 'supported_but_task_may_be_impractical',
-            'bitsandbytes_cuda': True,
-            'comfyui': False
+            'bitsandbytes_cuda': True
         },
         'placement_support': {
             'single_gpu': True,
@@ -8050,8 +7698,7 @@ RAW_MODEL_PROFILES = [
             'cuda': 'supported',
             'mps': 'pipeline_dependent_and_unverified',
             'cpu': 'supported_but_task_may_be_impractical',
-            'bitsandbytes_cuda': True,
-            'comfyui': False
+            'bitsandbytes_cuda': True
         },
         'placement_support': {
             'single_gpu': True,
@@ -8263,8 +7910,7 @@ RAW_MODEL_PROFILES = [
             'cuda': 'supported',
             'mps': 'pipeline_dependent_and_unverified',
             'cpu': 'supported_but_task_may_be_impractical',
-            'bitsandbytes_cuda': True,
-            'comfyui': False
+            'bitsandbytes_cuda': True
         },
         'placement_support': {
             'single_gpu': True,
@@ -8556,131 +8202,6 @@ RAW_MODEL_PROFILES = [
         'notes': ['Underlying runtime artifact selected by chat_gui.py for the logical Qwen3.6 35B A3B launcher entry.'],
         'application_source_files': ['chat_gui.py']
     },
-    {
-        'key': 'qwen3_coder_next_source',
-        'model_id': 'Qwen/Qwen3-Coder-Next',
-        'runtime_model_id': 'Qwen/Qwen3-Coder-Next',
-        'launcher_id': None,
-        'display_name': 'Qwen3 Coder Next Source Configuration',
-        'category': 'llm',
-        'task': 'tokenizer_and_config_source',
-        'checkpoint': {'format': 'safetensors', 'native_dtype': 'bfloat16', 'already_quantized': False},
-        'architecture': {
-            'family': 'qwen3_coder_next_moe',
-            'parameter_billions': 80.0,
-            'active_parameter_billions': 3.0,
-            'hidden_size': 2048,
-            'intermediate_size': 5120,
-            'num_hidden_layers': 48,
-            'num_attention_heads': 16,
-            'num_key_value_heads': 2,
-            'head_dim': 256,
-            'max_context_tokens': 262144,
-            'vocab_size': 151936,
-            'uses_kv_cache': True,
-            'cache_dtype': 'bfloat16'
-        },
-        'components': {
-            'language_model': {
-                'role': 'llm_decoder',
-                'architecture': 'qwen3_coder_next_moe',
-                'parameter_billions': 80.0,
-                'active_parameter_billions': 3.0,
-                'native_dtype': 'bfloat16',
-                'quantizable_fraction': 0.93,
-                'checkpoint_storage_gib': 0.0,
-                'checkpoint_storage_basis': 'repository_file_inventory',
-                'phases': ['prefill', 'decode'],
-                'sharding': 'decoder_block_sharding_and_automatic_device_map',
-                'offload': 'device_map_cpu_overflow_or_cpu_execution',
-                'quantization_support': {'int8': 'supported_with_bitsandbytes', 'int4': 'supported_with_bitsandbytes'},
-                'skip_modules': ['model.embed_tokens', 'lm_head', 'normalization_layers'],
-                'memory_overrides_gib': {},
-                'confidence': 'high',
-                'evidence': 'published_configuration_and_parameter_class',
-                'notes': []
-            }
-        },
-        'execution_phases': [
-            {
-                'name': 'prefill',
-                'required_components': ['language_model'],
-                'dynamic_memory_scales_with': ['batch_size', 'padded_prompt_tokens', 'attention_backend']
-            },
-            {
-                'name': 'decode',
-                'required_components': ['language_model'],
-                'dynamic_memory_scales_with': ['batch_size', 'cached_tokens', 'generated_tokens']
-            }
-        ],
-        'default_workload': {'batch_size': 1, 'prompt_tokens': 4096, 'max_new_tokens': 4096},
-        'runtime_memory': {
-            'dominant_terms': [
-                'weights',
-                'kv_cache',
-                'prefill_mlp_activations',
-                'attention_workspace',
-                'quantization_temporaries'
-            ],
-            'kv_cache_formula_bytes': '2 * batch * cached_tokens * layers * kv_heads * head_dim * cache_dtype_bytes',
-            'prefill_risk': 'high',
-            'decode_risk': 'medium',
-            'default_runtime_headroom_gib': 4.0
-        },
-        'backend_support': {
-            'cuda': 'supported',
-            'mps': 'supported_with_transformers_operator_and_memory_limits',
-            'cpu': 'supported',
-            'cpu_practicality': 'usable',
-            'bitsandbytes_cuda': True,
-            'vllm': False
-        },
-        'placement_support': {
-            'single_gpu': True,
-            'multi_gpu_device_map': True,
-            'decoder_block_sharding': True,
-            'cpu_overflow_device_map': True,
-            'cpu_only': True,
-            'sequential_cpu_offload': False
-        },
-        'quantization_policy': {
-            'int8_auto_allowed': True,
-            'int8_quality_risk': 'low',
-            'int4_auto_allowed': True,
-            'int4_quality_risk': 'medium',
-            'int4_priority': 'prefer_native_gguf_application_artifact',
-            'minimum_automatic_bits': 4,
-            'reasoning_or_precision_sensitive': False,
-            'keep_high_precision': ['embeddings', 'normalization', 'lm_head']
-        },
-        'current_code': {
-            'loader': 'metadata_only_for_gguf_runtime',
-            'quantization': 'native',
-            'plan': 'not_loaded_by_application'
-        },
-        'existing_fast_path': {
-            'plan_id': 'qwen3_coder_next_source_current_application_path',
-            'hardware_match': {'backend': 'cuda', 'gpu_count': 1, 'minimum_total_vram_gib_each': 0},
-            'loader': 'metadata_only_for_gguf_runtime',
-            'placement': 'not_loaded_by_application',
-            'quantization': {'language_model': 'native'},
-            'max_memory_gib': {},
-            'preserve_exact_loader': True
-        },
-        'sources': [
-            'https://huggingface.co/Qwen/Qwen3-Coder-Next',
-            'https://huggingface.co/Qwen/Qwen3-Coder-Next/blob/main/config.json',
-            'https://huggingface.co/Qwen/Qwen3-Coder-Next/tree/main'
-        ],
-        'confidence': {
-            'architecture': 'high',
-            'weight_memory': 'high',
-            'runtime_peak': 'estimated',
-            'quantization_quality': 'policy_and_research_inference'
-        },
-        'notes': ['Used as tokenizer and Hugging Face configuration source for the Q4_K_M GGUF application model.'],
-        'application_source_files': ['chat_gui.py']
-    }
 ]
 
 
@@ -8716,8 +8237,6 @@ def component_memory_for_precision(profile, component, precision):
             bytes_per_parameter = quantizable_fraction * 1.05 + (1.0 - quantizable_fraction) * native_bytes
         elif checkpoint_format == 'native_mxfp4':
             bytes_per_parameter = quantizable_fraction * 0.58 + (1.0 - quantizable_fraction) * native_bytes
-        elif checkpoint_format == 'gguf_q4_k_m':
-            bytes_per_parameter = quantizable_fraction * 0.62 + (1.0 - quantizable_fraction) * native_bytes
         elif checkpoint_format == 'native_bnb_nf4':
             bytes_per_parameter = quantizable_fraction * 0.56 + (1.0 - quantizable_fraction) * native_bytes
         else:
@@ -8764,7 +8283,7 @@ def component_precision_map(profile, mode):
         role = component.get('role')
         support = component.get('quantization_support', {})
 
-        if checkpoint_format in ['native_fp8', 'native_mxfp4', 'gguf_q4_k_m', 'native_bnb_nf4']:
+        if checkpoint_format in ['native_fp8', 'native_mxfp4', 'native_bnb_nf4']:
             if mode in ['native', 'checkpoint_native']:
                 precision_map[component_name] = 'checkpoint_native'
                 continue
@@ -8806,7 +8325,7 @@ def component_precision_map(profile, mode):
 def weight_precision_key(precision):
     if precision in ['int8', '8bit', 'bnb_int8']:
         return 'int8'
-    if precision in ['int4', '4bit', 'bnb_nf4', 'gguf_q4_k_m', 'native_mxfp4', 'checkpoint_native_nf4']:
+    if precision in ['int4', '4bit', 'bnb_nf4', 'native_mxfp4', 'checkpoint_native_nf4']:
         return 'int4'
     return 'native'
 
@@ -8957,7 +8476,7 @@ def candidate_memory_estimate(profile, precision_map, placement, workload=None):
     elif placement == 'vllm_tensor_parallel':
         required_total_vram = resident_weight + runtime_headroom
         largest_gpu = max(runtime_headroom + 2.0, required_total_vram / 2.0)
-    elif placement in ['mps_resident_or_unified_memory', 'comfyui_managed']:
+    elif placement == 'mps_resident_or_unified_memory':
         required_total_vram = resident_weight + runtime_headroom
         largest_gpu = required_total_vram
     else:
@@ -9122,15 +8641,10 @@ def build_diffusion_plans(profile):
 
     placement = profile.get('placement_support', {})
     checkpoint = profile.get('checkpoint', {})
-    checkpoint_format = checkpoint.get('format')
     already_quantized = checkpoint.get('already_quantized', False)
     int8_allowed = profile.get('quantization_policy', {}).get('int8_auto_allowed', True) and not already_quantized
     int4_allowed = profile.get('quantization_policy', {}).get('int4_auto_allowed', False) and not already_quantized
     multi_gpu = placement.get('multi_gpu_component_placement') or placement.get('multi_gpu_block_sharding')
-
-    if checkpoint_format == 'comfy_checkpoint_native':
-        plans.append(make_candidate_plan(profile, 'comfy_native', 'native'))
-        return plans
 
     plans.append(make_candidate_plan(profile, 'resident_native_single', 'native'))
     if multi_gpu:
@@ -9326,7 +8840,7 @@ def validate_registry():
                 normalized = precision
                 if precision in ['int8', '8bit', 'bnb_int8', 'native_fp8']:
                     normalized = 'int8'
-                elif precision in ['int4', '4bit', 'bnb_nf4', 'gguf_q4_k_m', 'native_mxfp4', 'checkpoint_native_nf4']:
+                elif precision in ['int4', '4bit', 'bnb_nf4', 'native_mxfp4', 'checkpoint_native_nf4']:
                     normalized = 'int4'
                 elif precision in ['checkpoint_native', 'bfloat16', 'float16', 'float32']:
                     normalized = 'native'

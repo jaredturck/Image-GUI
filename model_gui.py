@@ -3,7 +3,7 @@ import dotenv
 
 dotenv.load_dotenv()
 
-from app_config import apply_runtime_environment, get_path
+from app_config import apply_runtime_environment
 
 apply_runtime_environment()
 
@@ -20,7 +20,6 @@ from diffusers import DiffusionPipeline, AllegroPipeline, AutoencoderKLAllegro, 
 from base_gui import DiffusionGUI
 from vram_estimation import Kandinsky5I2VProVramEstimator
 from model_loading import Flux2Generator, GLMImageGenerator, QwenImageGenerator, QwenImageEditGenerator, ChronoEditGenerator, Kandinsky5I2VGenerator
-from comfy_backend import connect_comfy_backend
 import os, time
 from diffusers import AutoModel, SkyReelsV2DiffusionForcingPipeline, UniPCMultistepScheduler
 from diffusers.utils import export_to_video
@@ -147,45 +146,6 @@ class PixArtSigmaGUI(DiffusionGUI):
                 "max_memory": {0: "22GiB", 1: "22GiB", "cpu": "80GiB"},
             },
         )
-
-        with self.model_lock:
-            self.model_loading = False
-
-class AnimaGUI(DiffusionGUI):
-    def __init__(self):
-        super().__init__(
-            args = {
-                'title': "Anima GUI",
-                'image_folder': 'anima/',
-                'width': 1280, 'height': 768, 'guidance_scale': 3.5,
-                'num_inference_steps': 40, 'num_images_per_prompt': 3,
-                'max_sequence_length': 512,
-                'backend': "comfy",
-                'callback_on_step_end': False,
-                'comfyui_dir': get_path("comfyui_dir"),
-                'unet_name': "anima-preview.safetensors",
-                'clip_name': "qwen_3_06b_base.safetensors",
-                'clip_type': "qwen_image",
-                'vae_name': "qwen_image_vae.safetensors",
-            }
-        )
-
-    def load_model(self):
-        with self.model_lock:
-            if self.pipe is not None and self.preview_vae is not None and self.comfy_nodes is not None:
-                return
-            self.model_loading = True
-
-        nodes = connect_comfy_backend(self.comfyui_dir)
-        
-        model = nodes.UNETLoader(self.unet_name, "default")
-        clip = nodes.CLIPLoader(self.clip_name, self.clip_type, "default")
-        vae = nodes.VAELoader(self.vae_name)
-
-        with self.model_lock:
-            self.comfy_nodes = nodes
-            self.pipe = (model, clip)
-            self.preview_vae = vae
 
         with self.model_lock:
             self.model_loading = False
@@ -2330,7 +2290,6 @@ MODEL_REGISTRY = {
     "z_image_turbo": ZImageTurboGUI,
     "kandinsky_5": Kandinsky5T2ILiteSFTGUI,
     "pixart_sigma": PixArtSigmaGUI,
-    "anima": AnimaGUI,
     "stable_diffusion_3_5": StableDiffusion35GUI,
     "flux_1": BlackForestFluxGUI,
     "glm_image": GLMImageGUI,

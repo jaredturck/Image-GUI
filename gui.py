@@ -1,4 +1,4 @@
-import os, sys, subprocess, shutil, io, json, base64, threading, uuid
+import os, sys, subprocess, io, json, base64, threading, uuid
 from copy import deepcopy
 import dotenv
 
@@ -9,10 +9,11 @@ from PIL import Image
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from tkinter import filedialog, messagebox
 
-from app_config import apply_runtime_environment, load_user_config, resolve_output_path, save_user_config
+from app_config import apply_runtime_environment, chat_history_path, load_user_config, resolve_output_path, save_user_config
 from hardware_detection import detect_hardware, hardware_summary
 from hardware_planner import plan_attempts, save_plan_file
 from planner_protocol import MEMORY_RETRY_EXIT_CODE
+from platform_utils import ffmpeg_executable
 
 apply_runtime_environment()
 
@@ -20,7 +21,6 @@ MODELS = [
     ('Z Image Turbo', 'z_image_turbo', 'image', '6B'),
     ('Kandinsky 5', 'kandinsky_5', 'image', '6B'),
     ('PixArt Sigma', 'pixart_sigma', 'image', '0.6B'),
-    ('Anima', 'anima', 'image', '2B'),
     ('Stable Diffusion 3.5', 'stable_diffusion_3_5', 'image', '8B'),
     ('Black Forest FLUX.1', 'flux_1', 'image', '12B'),
     ('GLM Image', 'glm_image', 'image', '16B'),
@@ -67,7 +67,6 @@ MODELS = [
     ('Qwen3.6 27B', 'Qwen/Qwen3.6-27B', 'chat', '27B'),
     ('Gemma 4 31B IT', 'google/gemma-4-31B-it', 'chat', '31B'),
     ('Qwen3.6 35B A3B', 'Qwen/Qwen3.6-35B-A3B', 'chat', '35B-3A'),
-    ('Qwen3 Coder Next (80B)', 'Qwen/Qwen3-Coder-Next-GGUF:Q4_K_M', 'chat', '80B-3A'),
 ]
 
 MODEL_KIND_BY_ID = {model_id: model_kind for _, model_id, model_kind, _ in MODELS}
@@ -83,14 +82,12 @@ REASONING_CHAT_MODEL_IDS = {
     "Qwen/Qwen3.6-27B",
     "google/gemma-4-31B-it",
     "Qwen/Qwen3.6-35B-A3B",
-    "Qwen/Qwen3-Coder-Next-GGUF:Q4_K_M",
 }
 
 MODEL_PREVIEW_DIRS = {
     "z_image_turbo": "z_image_turbo/",
     "kandinsky_5": "kandinsky/",
     "pixart_sigma": "pixart_sigma/",
-    "anima": "anima/",
     "stable_diffusion_3_5": "stable_diffusion3.5/",
     "flux_1": "black_forest/",
     "glm_image": "glm_image/",
@@ -138,7 +135,7 @@ class SettingsDialog:
 
         description = ctk.CTkLabel(
             self.window,
-            text="These paths are optional. Leave Output root blank to store generated media in the project media folder.",
+            text="These paths are optional. Leave Output root blank to use the platform's default media folder.",
             text_color="#a8a8a8",
             anchor="w",
         )
@@ -149,8 +146,7 @@ class SettingsDialog:
         form.grid_columnconfigure(1, weight=1)
 
         self.add_path_row(form, 0, "huggingface_cache_dir", "Hugging Face cache")
-        self.add_path_row(form, 1, "comfyui_dir", "ComfyUI directory")
-        self.add_path_row(form, 2, "output_root", "Media output root")
+        self.add_path_row(form, 1, "output_root", "Media output root")
 
         buttons = ctk.CTkFrame(self.window, fg_color="transparent")
         buttons.grid(row=3, column=0, sticky="e", padx=20, pady=(0, 18))
@@ -376,7 +372,7 @@ class LauncherApp:
                 return img.copy()
 
         if ext in (".mp4", ".webm", ".mov", ".mkv"):
-            ffmpeg = shutil.which("ffmpeg")
+            ffmpeg = ffmpeg_executable()
             if not ffmpeg:
                 return None
 
@@ -417,7 +413,7 @@ class LauncherApp:
         return AESGCM(key).decrypt(nonce, encrypted, None)
 
     def load_chat_history_store(self):
-        path = os.path.join(self.base_dir, "chat_history.enc")
+        path = chat_history_path()
 
         if not os.path.isfile(path):
             return {}
