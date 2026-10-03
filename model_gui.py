@@ -30,7 +30,6 @@ from PIL import Image, ImageOps
 from diffusers.utils import load_image
 import cv2
 import numpy as np
-from huggingface_hub import hf_hub_download
 from diffusers import StableDiffusionUpscalePipeline
 from planner_runtime import execution_device, get_active_plan, is_cuda_plan, is_exact_fast_path, load_component, load_diffusers_pipeline, plan_placement, prepare_preview_vae, torch_dtype
 
@@ -2135,99 +2134,6 @@ class RMBG14GUI(DiffusionGUI):
         self.app.after(0, self.update_progress_widgets)
         self.app.after(0, self.finish_generate)
 
-class RealESRGANGUI(DiffusionGUI):
-    def __init__(self):
-        self.upsampler = None
-
-        super().__init__(
-            args = {
-                'title': "Real-ESRGAN GUI",
-                'image_folder': 'real_esrgan/',
-                'prompt': "Upscale",
-                'batch_size': 1,
-                'callback_on_step_end': False,
-                'show_ipp': False,
-
-                'supports_source_image': True,
-                'source_image_path': '',
-                'lock_source_aspect_ratio': True,
-                'auto_size_from_source_on_select': False,
-
-                'extra_params': [
-                    ("outscale", "Outscale", float),
-                ],
-                'outscale': 4.0,
-
-                'pipeline_args': []
-            }
-        )
-        os.makedirs(self.image_folder, exist_ok=True)
-
-    def load_model(self):
-        with self.model_lock:
-            if self.upsampler is not None:
-                return
-            self.model_loading = True
-
-        from basicsr.archs.rrdbnet_arch import RRDBNet
-        from realesrgan import RealESRGANer
-
-        model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=4)
-        weights = hf_hub_download(repo_id="lllyasviel/Annotators", filename="RealESRGAN_x4plus.pth")
-        use_cuda = execution_device(self.active_plan).startswith("cuda")
-        upsampler = RealESRGANer(
-            scale=4,
-            model_path=weights,
-            model=model,
-            tile=0,
-            tile_pad=10,
-            pre_pad=0,
-            half=use_cuda,
-            gpu_id=0 if use_cuda else None,
-        )
-
-        with self.model_lock:
-            self.upsampler = upsampler
-            self.pipe = upsampler
-            self.preview_vae = None
-            self.model_loading = False
-
-    def generate_diffusers(self):
-        os.makedirs(self.image_folder, exist_ok=True)
-
-        if self.source_image_pil is None:
-            return self.app.after(0, self.finish_generate)
-
-        with self.model_lock:
-            upsampler = self.upsampler
-
-        if upsampler is None:
-            return self.app.after(0, self.finish_generate)
-
-        self.progress_total = 1
-        self.progress_step = 0
-        self.progress = 0.0
-        self.app.after(0, self.update_progress_widgets)
-
-        rgb = self.source_image_pil.copy().convert("RGB")
-        bgr = cv2.cvtColor(np.array(rgb), cv2.COLOR_RGB2BGR)
-
-        outscale = float(getattr(self, "outscale", 4.0) or 4.0)
-        out_bgr, _ = upsampler.enhance(bgr, outscale=outscale)
-
-        out_rgb = cv2.cvtColor(out_bgr, cv2.COLOR_BGR2RGB)
-        out_img = Image.fromarray(out_rgb)
-
-        ts = int(time.time())
-        out_path = os.path.join(self.image_folder, f"output_{ts}.png")
-        out_img.save(out_path)
-        self.app.after(0, self.set_preview_image, out_img.copy())
-
-        self.progress = 1.0
-        self.progress_step = 1
-        self.app.after(0, self.update_progress_widgets)
-        self.app.after(0, self.finish_generate)
-
 class SDX4UpscalerGUI(DiffusionGUI):
     def __init__(self):
         super().__init__(
@@ -2445,7 +2351,6 @@ MODEL_REGISTRY = {
     "chronoedit": ChronoEditGUI,
     "qwen_image_edit": QwenImageEditGUI,
     "rmbg_1_4": RMBG14GUI,
-    "real_esrgan": RealESRGANGUI,
     "sd_x4_upscaler": SDX4UpscalerGUI,
 }
 

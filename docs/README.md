@@ -12,27 +12,27 @@
 
 The packaging design is feasible, but the repository is **not yet proven release-ready on Apple Silicon**. There are three different claims and they must not be conflated:
 
-- **Packaging feasibility — high confidence:** Apple supports Developer ID distribution in a notarized DMG, CPython and the core Python graph have native `arm64` artifacts, and the application can own downloaded, signed runtime packs.
+- **Packaging feasibility — high confidence:** Apple supports Developer ID distribution in a notarized DMG, CPython and the core Python graph have native `arm64` artifacts, and the application can create and own an ordinary virtual environment.
 - **Core dependency availability — demonstrated at metadata/resolver level:** a coherent Python 3.12/macOS `arm64` core graph can be resolved entirely from binary artifacts when the Torch family is pinned.
 - **All-model runtime compatibility — not yet demonstrated:** no physical M1–M5 model-by-model run has been performed in this Linux audit environment. The current planner simulations are not evidence that a pipeline's MPS operators work.
 
 Consequently, the correct decision is **proceed with the macOS release engineering work, but do not advertise “all models work on Apple Silicon” until the physical-device acceptance ledger is complete**.
 
-The recommended release is a **hybrid, online-first DMG**:
+The recommended release is a **simple online-first DMG**:
 
 1. Ship a small, signed and notarized native `arm64` `.app` inside a DMG.
-2. Give that app ownership of a pinned CPython 3.12 runtime. Do not use or modify a system, Homebrew, Conda, or user-installed Python.
-3. On first launch, download signed, versioned dependency packs selected for macOS and Apple Silicon. Install them under the user's Application Support directory, not inside the signed application bundle.
-4. Keep model checkpoints entirely outside every DMG and dependency pack. Download them only when a user selects a model, using a configurable model store with free-space checks, resumable transfers, and cache management.
+2. Include one CPython 3.12 `arm64` runtime in the DMG, or download that one fixed runtime on first launch. Do not depend on a Python already installed on the Mac.
+3. Create a normal `venv` under Application Support and run ordinary `python -m pip install` from exact macOS lockfiles. Stable upstream wheels from PyPI are the default, not an exception. Use `--require-hashes` and `--only-binary=:all:` so the installation is repeatable and never invokes a compiler.
+4. Keep model checkpoints entirely outside the DMG and virtual environment. Download them only when a user selects a model, using a configurable model store with free-space checks and cache management.
 5. Continue to support Linux/CUDA from source with separate locked dependency manifests. No CUDA library belongs in a macOS artifact.
 6. Preserve every model and feature, but finish the two macOS backend gaps and validate every model on physical Macs before calling the release complete.
-7. Do not ship nightly wheels, development-channel installers, unverified third-party binaries, live `pip` resolution, or `curl | sh`. Build or mirror every approved artifact in controlled CI, hash it, generate an SBOM, sign it, and distribute it from a project-controlled origin.
+7. Do not ship nightly wheels, development-channel installers, arbitrary Git URLs, unverified binary mirrors, or `curl | sh`. Exact stable PyPI wheels are acceptable. Resolve and test the lock in CI, then let `pip` install that lock on the user's Mac.
 
-This is the middle ground between the three proposals. It provides a “double-click and it works” product without turning the DMG into a many-gigabyte, difficult-to-update dependency snapshot. A second, larger **offline-dependencies DMG** can be generated from the same pinned packs for installations without reliable internet. That artifact would still contain **zero model weights**.
+This is the middle ground between the three proposals. It provides a “double-click and it works” product without inventing a custom package manager or turning the DMG into a many-gigabyte dependency snapshot. A second, larger **offline-dependencies DMG** can contain the exact wheelhouse consumed by the same lockfile. That artifact would still contain **zero model weights**.
 
 > **Non-negotiable packaging invariant:** model weights are never bundled in the `.app`, DMG, Python runtime, ComfyUI pack, or any other installer artifact. The maintainers report that a fully populated development model store is close to 600 GB. The software must treat models as separately managed user data.
 
-> **Non-negotiable dependency invariant:** “it can be downloaded” is not evidence that it belongs in the product. A release dependency must have an identifiable upstream, a reviewed license, a pinned source or first-party release artifact, reproducible provenance, vulnerability review, and passing tests on the supported Apple GPU/OS matrix. The end-user installer must never resolve arbitrary packages from PyPI or execute a network-fetched install script.
+> **Dependency invariant:** use ordinary stable packages where they are sufficient. A release dependency needs an identifiable upstream, reviewed license, exact pinned version and hashes, and passing tests. The installer may download the exact locked wheels from PyPI; it must not ask PyPI to choose new versions, install arbitrary packages, use nightlies, compile surprise source distributions, or execute fetched shell scripts.
 
 ## What “just works” should mean
 
@@ -71,7 +71,7 @@ The two Linux environments contain 261 and 141 installed distributions respectiv
 flowchart TD
     A["gui.py — main launcher"] --> B["hardware_detection.py"]
     A --> C["hardware_planner.py"]
-    C --> D["model_registry.py — 54 profiles / 50 launcher models"]
+    C --> D["model_registry.py — 53 profiles / 49 launcher models"]
     A --> E["model_gui.py — image, video, utilities"]
     A --> F["chat_gui.py — chat and speech"]
     E --> G["base_gui.py — shared generation UI"]
@@ -122,7 +122,7 @@ Image-GUI
 │   ├── numpy
 │   ├── scipy
 │   ├── matplotlib
-│   ├── opencv-python
+│   ├── opencv-contrib-python
 │   ├── imageio
 │   ├── imageio-ffmpeg
 │   │   └── packaged platform FFmpeg binary in a normal PyPI wheel
@@ -132,11 +132,6 @@ Image-GUI
 │   ├── sounddevice
 │   │   └── PortAudio dylib contained in the macOS PyPI wheel
 │   └── nvidia-ml-py / NVML (Linux CUDA only in practice)
-├── Separately installed legacy upscaler
-│   ├── BasicSR 1.4.2 source archive
-│   ├── realesrgan 0.3.0
-│   ├── facexlib (declared upstream, currently absent locally)
-│   └── gfpgan (declared upstream, currently absent locally)
 ├── Managed ComfyUI path used by Anima
 │   ├── separate CPython environment
 │   ├── ComfyUI v0.28.0 source
@@ -146,7 +141,7 @@ Image-GUI
 │   └── comfy-script[default] in both Python environments
 └── Optional chat engine
     ├── Linux: vLLM + CUDA/Triton
-    └── macOS: project-built llama.cpp + Metal for the official GGUF
+    └── macOS: pinned llama.cpp + Metal for the official GGUF
 ```
 
 The source manifests are:
@@ -162,43 +157,11 @@ Observed versions in the current Linux main environment include Python 3.14, Tor
 
 TensorFlow, JAX, Core ML, and MLX are **not** dependencies of the current application. They should not be added to a Mac pack merely because they exist on Apple Silicon. MLX is relevant only as a possible replacement backend for particular language-model paths; it is not required for the existing PyTorch/Diffusers application.
 
-### Direct-manifest disposition
+### Practical dependency decisions
 
-This table accounts for every top-level name in the five first-party requirements files. “No direct import” means no tracked application module imports it; it may still be needed by an executed upstream model path, which must be demonstrated before removing it from the resolved graph.
+The release does not need a dependency-by-dependency rewrite. Keep the normal Python stack and install stable macOS wheels with `pip` from a tested, hash-locked requirements file. Use `opencv-contrib-python`, `imageio-ffmpeg`, and SoundDevice as ordinary pinned dependencies; no custom builds are justified unless an official wheel actually fails qualification.
 
-| Declared dependency | Direct use found | macOS release disposition |
-|---|---|---|
-| `customtkinter` | All three main GUI surfaces | Keep and lock; pure-Python UI dependency |
-| `python-dotenv` | Launcher, chat, and model GUI configuration | Keep for release 1.0 or replace later with an app-owned settings layer; no Mac blocker |
-| Pillow | GUI assets and image I/O/editing | Keep and lock; exercise its native codecs in signing/import tests |
-| `cryptography` | AES-GCM for chat/secrets | Keep; use an upstream stable wheel or project build and sign its native extension |
-| NumPy | Directly and throughout ML/media dependencies | Keep as core numerical ABI; pin against SciPy/Torch/media wheels |
-| `opencv-python` | Image editor, previews, colour conversion, saliency, Haar cascades, upscaler conversion | Replace most call sites; project-build official OpenCV/Contrib only if the remainder justifies it |
-| Matplotlib | Chat audio waveform rendering only | Strong removal candidate: draw the waveform with Tk Canvas or Pillow and eliminate a large plotting stack |
-| Transformers | Chat, segmentation, multimodal and staged loaders | Keep; lazy-import per adapter and qualify each architecture on MPS |
-| Accelerate | No direct import; required by model frameworks/loaders | Keep in the resolved ML graph where upstream metadata/tests require it; need not remain a hand-maintained universal direct requirement |
-| Diffusers | Image/video/upscale pipelines | Keep; largest model-specific API compatibility surface, so lazy-import and pin tightly |
-| Hugging Face Hub | Direct checkpoint downloads | Keep as model-store transport; pin code revisions and keep weights outside packs |
-| Safetensors | No direct module import; dominant checkpoint format | Keep in ML resolution and validate native extension/import; do not confuse library code with model weights |
-| SentencePiece | No direct import; tokenizer backend for selected models | Keep only in packs whose tested tokenizers require it |
-| Protobuf | No direct import | Remove from universal direct inputs; allow the lock resolver to include the tested compatible version where required |
-| `psutil` | Unified/host-memory detection | Keep for release 1.0; compare its readings with native macOS APIs during planner qualification |
-| SoundDevice | Microphone capture | Keep in an audio feature boundary; lazy-load and bind to project-built/signed PortAudio |
-| SciPy | No direct import | Remove from universal direct inputs if model-adapter and transitive tests remain green; otherwise lock only where required |
-| Einops | No direct import | Treat as model/framework transitive or adapter-specific, not an unconditional application dependency |
-| `timm` | No direct import | Treat as model/remote-code-specific; pin only for the exact audited model path that proves it needs it |
-| ImageIO | No direct import | Remove from direct inputs after video export tests establish whether Diffusers needs it transitively |
-| `imageio-ffmpeg` | No direct API call; application currently searches `PATH` | Remove after routing all subprocess work to the one project-built/signed FFmpeg binary |
-| PyAV | No direct import in tracked code | Retain only if executed video pipelines require it; use its frozen native libraries or a project build consistently with the FFmpeg policy |
-| PEFT | No direct import | Model/framework-specific; retain through the tested lock only where a loader needs adapters |
-| `nvidia-ml-py` | Eager NVML imports in shared base GUI | Move exclusively to Linux/CUDA and lazy-load; exclude from every Mac artifact |
-| Torch | Core tensor and model runtime | Keep one stable, hash-locked family; MPS is the Mac accelerator and CUDA remains in separate Linux locks |
-| TorchVision | Indirect/legacy upscaler and model ecosystem | Keep only where the tested graph needs it; exact version must match Torch |
-| TorchAudio | No direct application import | Keep only if Comfy/model execution proves it is required; exact version must match Torch |
-| BitsAndBytes | Quantization configured by chat/model loaders | Provisional Mac component; no dynamic Hub kernels and no release promise until each configuration passes |
-| vLLM | Optional Linux chat engine | Linux/CUDA only. Exclude from Mac and use project-built `llama.cpp` solely for the GGUF Mac path |
-
-The low-risk slimming opportunities are therefore Matplotlib, unconditional Protobuf/SciPy/Einops/timm/ImageIO/PyAV/PEFT declarations, duplicate FFmpeg delivery, ComfyScript, and NVIDIA telemetry on Mac. Removing a name from the direct manifest does not necessarily remove it from a feature-specific lock; the executed adapter graph decides that.
+CUDA, NVML, and vLLM remain in Linux-only requirements. On macOS, PyTorch uses MPS. ComfyUI stays isolated because Anima needs it; that one model is the only remaining removal candidate that would eliminate an entire second Python environment and duplicate Torch installation. No other model removal is recommended at this stage.
 
 ### Target-aware macOS dependency resolution performed for this audit
 
@@ -207,7 +170,7 @@ The repository was resolved as Python 3.12 for `aarch64-apple-darwin` with a mac
 The successful core experiment used `uv 0.12.22` with the following shape; the Comfy experiment added its pinned requirements and the narrow ComfyScript runtime input:
 
 ```shell
-uv pip compile requirements-macos.txt requirements.txt \
+MACOSX_DEPLOYMENT_TARGET=15.0 uv pip compile requirements-macos.txt requirements.txt \
   --python-version 3.12 \
   --python-platform aarch64-apple-darwin \
   --no-build \
@@ -222,7 +185,7 @@ The generated candidate locks were intentionally not committed as release locks.
 | Current unpinned `requirements-macos.txt` + `requirements.txt` | 72 packages resolve, but to Torch 2.14.1, TorchVision 0.29.1, and TorchAudio 2.11.0 | The manifests are unsafe: a fresh install can select an incoherent Torch family even though resolution succeeds |
 | Same inputs constrained to Torch 2.11.0, TorchVision 0.26.0, TorchAudio 2.11.0, BitsAndBytes 0.50.0, Transformers 5.14.1, Diffusers 0.39.0, and Accelerate 1.14.0 | 72 packages resolve with hashes and no source build | A coherent core artifact graph is available for the target; it is a candidate lock, not a certified release lock |
 | Candidate core + ComfyUI v0.28.0 requirements + `comfy-script[runtime]==0.6.1` | 115 packages resolve with hashes and no source build | The isolated Comfy environment is artifact-feasible, but the Anima workflow still needs an actual MPS run |
-| `realesrgan==0.3.0` with source builds disabled | Fails: Real-ESRGAN requires BasicSR 1.4.2 and BasicSR has no usable wheel | The current Real-ESRGAN chain is not a binary-only Mac release path and must not build itself on a user's Mac |
+| Historical `realesrgan==0.3.0` path with source builds disabled | Failed because BasicSR 1.4.2 has no usable wheel | The model and special installer path have now been removed, so this blocker no longer belongs to the release graph |
 
 The current installer uses `comfy-script[default]`, not the narrower `runtime` extra. That default extra pulls optional third-party node packages even though the application starts ComfyUI with `--disable-all-custom-nodes`. The application only uses a small core-node workflow. Replace ComfyScript with a first-party client for ComfyUI's prompt/history/view API, or at minimum use and lock the narrow runtime extra after provenance review. Direct API integration is preferred because it eliminates an unnecessary transitive trust surface.
 
@@ -233,33 +196,29 @@ The pinned candidate above is deliberately conservative and aligned to the exact
 | External dependency | Used for | Current acquisition | Release treatment |
 |---|---|---|---|
 | Hugging Face Hub | All model checkpoints; some config/tokenizer files; remote code for BRIA | Downloaded at model load | Retain for model data, but pin revisions and support resumable downloads |
-| GitHub / Comfy-Org | ComfyUI v0.28.0 source | Installer downloads a tag archive | Put the audited source/dependencies in a signed Comfy pack or verify a pinned archive hash |
-| GitHub / XPixelGroup | BasicSR 1.4.2 source | Installer downloads and locally patches a tag archive | Remove this acquisition path; replace the package chain with a first-party adapter or maintain a reviewed project fork built only in CI |
-| GitHub / xinntao Real-ESRGAN release | RealESRGAN_x4plus checkpoint | Code currently downloads a Hugging Face mirror | Preserve the model but acquire the original upstream release asset, verify and record its hash, then place it in the separate model store—not a dependency pack |
-| PyPI | Every Python dependency today | Live `pip install` during setup | Replace in releases with prebuilt, locked, signed runtime archives |
+| GitHub / Comfy-Org | ComfyUI v0.28.0 source | Installer downloads a tag archive | Keep the exact tagged source and install its tested, pinned Python requirements into the Comfy venv |
+| PyPI | Python dependencies | `pip install` during setup | Keep this normal workflow, but install an exact hash-locked macOS requirements file with binary wheels only |
 | Metal / MPS / Accelerate | Apple GPU and numerical acceleration | Supplied by macOS | Detect OS support; do not download GPU drivers |
-| CoreAudio / microphone permission | Voice input | macOS plus SoundDevice/PortAudio | Bundle the wheel payload and add `NSMicrophoneUsageDescription` |
-| FFmpeg | Video preview/processing | Code searches `PATH`, despite declaring `imageio-ffmpeg` | Resolve the packaged executable explicitly and sign it |
+| CoreAudio / microphone permission | Voice input | macOS plus SoundDevice/PortAudio | Install the pinned SoundDevice wheel and add `NSMicrophoneUsageDescription` |
+| FFmpeg | Video preview/processing | Code searches `PATH`, despite declaring `imageio-ffmpeg` | Use the executable supplied by the pinned `imageio-ffmpeg` wheel |
 | Local HTTP on `127.0.0.1` | ComfyUI API | Spawned by the app | Bind loopback only, use an ephemeral port, and stop it reliably |
 | Developer ID / Apple notary service | Gatekeeper trust | Not implemented | Required release infrastructure |
 
-`imageio-ffmpeg` publishes platform wheels containing FFmpeg and exposes `get_ffmpeg_exe()`, and SoundDevice's macOS wheel contains PortAudio. Those facts prove that Homebrew is unnecessary, but they do not by themselves satisfy the production provenance policy. The stronger release path is to build FFmpeg and PortAudio from pinned official source in controlled Apple Silicon CI, build the Python bindings against those libraries where necessary, sign the resulting Mach-O payloads, and ship the exact tested outputs. Sources: [imageio-ffmpeg](https://github.com/imageio/imageio-ffmpeg), [SoundDevice installation](https://python-sounddevice.readthedocs.io/en/0.5.5/installation.html), [FFmpeg](https://ffmpeg.org/), and [PortAudio](https://www.portaudio.com/).
-
-The Real-ESRGAN authors publish `RealESRGAN_x4plus.pth` in the project's own [v0.1.0 release](https://github.com/xinntao/Real-ESRGAN/releases/tag/v0.1.0). The current Hugging Face mirror is unnecessary. Switching the download origin after hash/output verification improves provenance without changing or bundling the model.
+`imageio-ffmpeg` publishes macOS wheels containing FFmpeg and exposes `get_ffmpeg_exe()`, while SoundDevice's macOS wheel includes PortAudio. Pinning those ordinary wheels is the simplest release path and avoids Homebrew. Sources: [imageio-ffmpeg](https://github.com/imageio/imageio-ffmpeg) and [SoundDevice installation](https://python-sounddevice.readthedocs.io/en/0.5.5/installation.html).
 
 ### Dependency admission and provenance policy
 
-The project should classify dependencies before they enter a signed pack:
+The project should classify dependencies before they enter a lockfile:
 
 | Class | Examples | Release rule |
 |---|---|---|
 | Platform/vendor supported | macOS Metal/MPS/Accelerate/CoreAudio; stable CPython; stable PyTorch family; Apple MLX if later justified | Allowed after exact-version locking and project tests; use stable releases only |
-| Established upstream library | Transformers, Diffusers, NumPy, SciPy, Pillow, cryptography, PyAV, FFmpeg, PortAudio, ComfyUI, `llama.cpp` | Use an upstream release/tag or exact reviewed commit; consume first-party wheels where policy permits, otherwise build from official source in CI; mirror, hash, scan, sign, and record in the SBOM |
-| Small pure-Python UI/application package | CustomTkinter, python-dotenv, PEFT, timm, einops | Lock exact source/artifact hashes and vendor or mirror after license and maintainer review; no live index resolution |
+| Established upstream library | Transformers, Diffusers, NumPy, SciPy, Pillow, cryptography, OpenCV wheels, PyAV, SoundDevice, ComfyUI, `llama.cpp` | Prefer the ordinary stable PyPI wheel, pin it with hashes, and test it. Build or vendor only when no suitable wheel exists |
+| Small pure-Python UI/application package | CustomTkinter, python-dotenv, PEFT, timm, einops | Install the exact hash-locked stable PyPI release normally |
 | Provisional accelerator | BitsAndBytes MPS | Not part of the production promise until every quantized model path passes on Apple GPU families 7–10 and macOS versions in scope; retain a non-BnB plan where feasible |
-| Rejected release mechanism | nightlies, continuous wheels, development channels, unsigned GitHub binaries, `curl | sh`, community model conversions, mutable branch archives, live PyPI installs | Never execute or fetch on an end-user machine |
+| Rejected release mechanism | nightlies, continuous wheels, development channels, arbitrary Git installs, `curl | sh`, unreviewed model conversions, mutable branch archives, unpinned PyPI resolution | Do not use in the end-user installation |
 
-This policy distinguishes an open-source dependency from an untrusted binary. A mature upstream such as `llama.cpp` can be acceptable when the project builds a pinned release from source and signs the output. A random wheel or model conversion uploaded by an unrelated account is not acceptable merely because its filename matches the platform.
+This policy is intentionally conventional: PyPI plus exact locks is the default. Extra build infrastructure is justified only for a dependency that lacks an acceptable wheel or for a non-Python engine such as `llama.cpp`.
 
 ## Current portability and release blockers
 
@@ -280,26 +239,26 @@ This policy distinguishes an open-source dependency from an untrusted binary. A 
 | All image/video pipeline classes imported eagerly | [`model_gui.py`](../model_gui.py) and [`model_loading.py`](../model_loading.py) import a large, version-sensitive Diffusers/Transformers surface at startup | Lazy-import per model so one unavailable class disables one model, not the entire image application |
 | `flex_attention` imported eagerly | Both model modules import `torch.nn.attention.flex_attention` before a model is selected | Capability-check it and provide the model-specific MPS path |
 | Audio imported eagerly | [`chat_gui.py`](../chat_gui.py) imports SoundDevice at startup | Lazy-load microphone support and present a permission/device error without disabling chat |
-| FFmpeg searched only on `PATH` in key paths | [`base_gui.py`](../base_gui.py) and [`gui.py`](../gui.py) use `shutil.which("ffmpeg")` | Use a signed helper built from pinned official FFmpeg source; never depend on Homebrew or the user's `PATH` |
-| OpenCV feature/package and provenance mismatch | [`img_editor.py`](../img_editor.py) uses `cv2.saliency`, but the manifest declares the non-contrib `opencv-python` wheel; the PyPI wheel is not built by the OpenCV project itself | Prefer replacing simple color/video operations with NumPy/Pillow/PyAV and the saliency/face-detection features with an audited implementation; otherwise build a minimal OpenCV/Contrib wheel from official source in project CI and sign it |
+| FFmpeg searched only on `PATH` in key paths | [`base_gui.py`](../base_gui.py) and [`gui.py`](../gui.py) use `shutil.which("ffmpeg")` | Resolve the executable with `imageio_ffmpeg.get_ffmpeg_exe()` from the installed pinned wheel |
+| Wrong OpenCV wheel declared | [`img_editor.py`](../img_editor.py) uses `cv2.saliency`, which is in OpenCV Contrib | Install the ordinary pinned `opencv-contrib-python` wheel instead of `opencv-python`; do not install both |
 | Remote Python execution | BRIA uses `trust_remote_code=True` without a pinned revision | Pin an audited commit and include its source/hash in the release manifest |
-| Real-ESRGAN chain cannot be binary-only | `pip check` reports missing `facexlib` and `gfpgan`; the installer patches BasicSR source; a target-aware no-build resolution fails because BasicSR 1.4.2 has no wheel; the code fetches the x4plus checkpoint from a mirror instead of the author release | Replace the stale package chain with an audited, self-contained RRDBNet/tiling adapter for the same x4plus model, source the unchanged checkpoint from the upstream Real-ESRGAN release, or build a complete reviewed fork in CI; never patch/build it during user setup |
 | ComfyScript default extra is broader than the feature | It is installed into both environments and pulls optional node packages while custom nodes are disabled | Replace it with a small direct ComfyUI API client and a versioned workflow JSON |
 | Torch family can resolve inconsistently | The unpinned Mac graph selected Torch 2.14.1 with TorchAudio 2.11.0 during this audit | Install one hash-locked, tested Torch/TorchVision/TorchAudio family in one transaction |
 | Validation scans generated environments | [`validate_project.py`](../validate_project.py) recursively compiles the repository and enters `.venv`, failing on unrelated third-party source | Restrict validation to tracked first-party files |
 
 ### Model-path blockers
 
-The registry contains 50 launcher-visible models and 54 profiles including auxiliary/runtime artifacts. The planner can synthesize MPS candidates for most entries, but that is not the same as executing the model on a Mac.
+The registry now contains 49 launcher-visible models and 53 profiles including auxiliary/runtime artifacts. Real-ESRGAN and its patched BasicSR installation path were removed after this audit. The planner can synthesize MPS candidates for most remaining entries, but that is not the same as executing the model on a Mac.
 
-Two launcher models currently have **no MPS-ready plan at any simulated memory size**:
+One launcher model currently has **no implemented MPS-ready execution path**:
 
-- **Real-ESRGAN x4plus:** the current `RealESRGANer` path is marked CUDA-only. Implement and validate MPS or CPU fallback while retaining the same model and result semantics.
-- **Qwen3 Coder Next 80B Q4_K_M:** the application currently routes the GGUF model through vLLM, while [`install.py`](../install.py) explicitly disables vLLM on macOS. Add a Mac adapter that launches a project-built and signed `llama.cpp` Metal server or links its library, using the same official Qwen Q4_K_M GGUF checkpoint. This preserves the model while replacing only its Mac execution engine.
+- **Qwen3 Coder Next 80B Q4_K_M:** the application currently routes the GGUF model through vLLM, while [`install.py`](../install.py) explicitly disables vLLM on macOS. Add a Mac adapter using a pinned stable `llama.cpp` Metal release and the same official Qwen Q4_K_M GGUF checkpoint.
 
 `vllm-metal` is **not recommended for the release 1.0 trust base**. It is part of the vLLM project, but its own installation page says ordinary `pip install vllm-metal` is unsupported, directs users to pipe a network script into a shell, and makes the development channel the default. Its feature page labels paged attention experimental. Those are useful prototype characteristics, not the deterministic release mechanism requested here. See the [vLLM Metal installation page](https://docs.vllm.ai/projects/vllm-metal/en/stable/installation/) and [feature overview](https://docs.vllm.ai/projects/vllm-metal/en/stable/).
 
-The preferred path is `llama.cpp` built by this project from a pinned upstream release/commit on Apple Silicon CI, with Metal enabled, then signed and placed in the GGUF engine pack. The official Qwen model card explicitly documents `llama.cpp` for `Qwen/Qwen3-Coder-Next-GGUF:Q4_K_M`, and `llama.cpp` contains the `QWEN3NEXT` architecture and Qwen3-Coder-Next test schema. Use the official Qwen-published GGUF shards, not a community conversion. Sources: [`llama.cpp`](https://github.com/ggml-org/llama.cpp) and the [official Qwen3-Coder-Next GGUF model card](https://huggingface.co/Qwen/Qwen3-Coder-Next-GGUF).
+The preferred path is a pinned stable `llama.cpp` release with Metal enabled. Use an upstream macOS binary if it passes packaging tests; build the tagged source only if necessary. The official Qwen model card documents `llama.cpp` for `Qwen/Qwen3-Coder-Next-GGUF:Q4_K_M`. Sources: [`llama.cpp`](https://github.com/ggml-org/llama.cpp) and the [official Qwen3-Coder-Next GGUF model card](https://huggingface.co/Qwen/Qwen3-Coder-Next-GGUF).
+
+There is only one other removal worth considering for dependency reduction: **Anima**. It is the sole reason the application installs a second Python environment, ComfyUI, ComfyScript, a local server, and a duplicate Torch stack. Removing Anima would delete that whole branch. Keep it if the model matters; ordinary Diffusers and Transformers models are not comparable cleanup candidates and should not be culled merely to shorten a requirements file.
 
 Additional risks requiring physical-Mac inference tests are:
 
@@ -366,10 +325,10 @@ Primary Apple sources: [M1](https://www.apple.com/newsroom/2020/11/apple-unleash
 |---|---|---|
 | PyTorch 2.11 MPS | Apple documents the stable 2.11 release for Apple Silicon, macOS 14+, and Python 3.10+, but explicitly labels the MPS backend beta | Use only the stable release family, never nightly; certify each model/operator path and retain tested CPU fallback where correct |
 | Transformers | Official docs say MPS lacks some PyTorch operations and `PYTORCH_ENABLE_MPS_FALLBACK=1` may be needed; whole-model placement generally must fit unified memory | Supported framework, not blanket model proof; test each architecture, precision, tokenizer/processor, generation mode, and fallback path |
-| Diffusers | Official MPS path exists, but docs warn about memory pressure, swap, batching failures, and attention slicing below 64 GB | Keep it; validate all 24 Diffusers-format launcher models at actual resolution/frame defaults rather than extrapolating from Stable Diffusion |
+| Diffusers | Official MPS path exists, but docs warn about memory pressure, swap, batching failures, and attention slicing below 64 GB | Keep it; validate all 23 Diffusers-format launcher models at actual resolution/frame defaults rather than extrapolating from Stable Diffusion |
 | BitsAndBytes 0.50 | Official upstream release says all 4-bit and LLM.int8 configurations now work on MPS; optimized Metal kernels require macOS 26+ and a separate Hub-delivered `kernels` package, while older systems use a naive fallback | Provisional on Mac. Dynamic Hub kernel downloads are prohibited. Test the self-contained fallback first; admit optimized kernels only if their exact source and build become reviewable, frozen pack inputs. Otherwise replace the affected quantization path with a model-supported stable alternative |
 | ComfyUI v0.28 | Official Comfy source and its dependencies resolve for macOS arm64 | Artifact-feasible, but only the real Anima workflow proves product support; use direct API integration and no third-party custom nodes |
-| `llama.cpp` | Upstream supports Metal and QWEN3NEXT; the official Qwen GGUF card documents it | Preferred Mac GGUF engine when built from pinned source and signed by this project; still requires exact-model tests |
+| `llama.cpp` | Upstream supports Metal and QWEN3NEXT; the official Qwen GGUF card documents it | Preferred Mac GGUF engine; pin one stable release and build only if its upstream macOS artifact is unsuitable |
 | `vllm-metal` | vLLM project plugin with macOS 15/arm64/Python 3.12 wheels, nonstandard script install, development default, and experimental features | Prototype only; rejected from release 1.0's production trust base |
 | MLX / MLX-LM | Apple-maintained framework and a plausible language-model alternative | Not required by the current app. Consider only if a tested model path cannot meet the release bar with PyTorch MPS or `llama.cpp`; do not use community-converted weights as a shortcut |
 
@@ -380,7 +339,7 @@ Sources: [Apple PyTorch/MPS](https://developer.apple.com/metal/pytorch/), [Trans
 - **Architecture:** Apple Silicon only, native `arm64`; reject Intel and reject launch under Rosetta. A larger `universal2` build would add an untested architecture with no product benefit.
 - **Deployment target:** macOS 15 for the binary and the oldest M1–M4 test lane. M5 machines cannot necessarily be downgraded to macOS 15 because Macs do not support installing a macOS version older than the one they shipped with; test each M5 on its factory-supported minimum and on the current macOS release.
 - **Memory:** the app shell should launch on 8 GB; 16 GB is the sensible public minimum for useful small-model coverage. The official Qwen Q4_K_M checkpoint is approximately 48.4 GB before KV cache and application/OS headroom, so 64 GB is a test boundary, not a guarantee; 96 GB or more is the safer full-catalogue validation tier until measurements prove otherwise.
-- **Disk:** require enough free space for the selected dependency pack plus temporary extraction headroom, then check the separate model store before every checkpoint download. Do not advertise one fixed disk requirement for a catalogue approaching 600 GB.
+- **Disk:** require enough free space for the Python environment and pip download/install headroom, then check the separate model store before every checkpoint download. Do not advertise one fixed disk requirement for a catalogue approaching 600 GB.
 - **Python:** one app-owned CPython 3.12 `arm64` patch release per application release. Never use system, Homebrew, Conda, or Rosetta Python.
 - **Build machine:** native Apple Silicon CI or controlled Macs. Linux can resolve metadata and run source tests, but it cannot execute, sign, notarize, or qualify the Mac runtime.
 
@@ -394,9 +353,9 @@ Apple lists M1-era Macs as compatible with macOS 15, so the floor retains the ol
 | M1–M5 are not one GPU target | Apple maps them to Apple7, Apple8, Apple9, and Apple10 | Established; four Metal-family lanes are mandatory |
 | A coherent core dependency graph exists | Target-aware Python 3.12/macOS arm64 no-build resolution: 72 hashed packages with a pinned Torch family | Established at artifact-metadata level only |
 | The Comfy dependency graph exists | Target-aware no-build resolution: 115 hashed packages using the narrow ComfyScript runtime extra | Established at artifact-metadata level only; direct API replacement is still preferred |
-| Current Real-ESRGAN packaging works | Binary-only target resolution fails at BasicSR; current installer patches source and omits declared deps | Disproved; refactor required |
+| Historical Real-ESRGAN packaging worked | Binary-only target resolution failed at BasicSR and the installer patched source | Disproved; the model and installer branch were removed |
 | Stable PyTorch can address MPS | Apple stable-release documentation and native target artifacts | Established at framework level; operator/model coverage unproved |
-| Every one of the 50 launcher models runs | Planner simulations and Linux tests only | **Not proved** |
+| Every one of the 49 launcher models runs | Planner simulations and Linux tests only | **Not proved** |
 | The app runs on Apple7/8/9/10 | No physical Mac execution in this audit | **Not proved** |
 | DMG signing/notarization works | Apple documents the workflow; no project artifact has been built | Feasible, **not yet executed** |
 
@@ -413,7 +372,7 @@ The existing planner was run against simulated MPS machines at 8, 16, 24, 32, 36
 | 24 GB | Qwen Image Edit 4-bit; Hunyuan Video 1.5 T2V/I2V; GPT-OSS 20B; Qwen3.6 27B |
 | 32 GB | FLUX.2; Kandinsky 5 T2V Pro distilled/SFT; Kandinsky 5 I2V Pro; Qwen2.5 32B; Falcon-H1 34B; DeepSeek R1 Distill Qwen 32B; Gemma 4 31B |
 | 48 GB | Qwen3.6 35B A3B |
-| No current MPS plan | Real-ESRGAN x4plus; Qwen3 Coder Next 80B GGUF |
+| No current MPS plan | Qwen3 Coder Next 80B GGUF |
 
 These are **planning estimates, not a support matrix**. They do not demonstrate operator compatibility, acceptable speed, successful generation, or sufficient headroom for macOS and the GUI. In particular, the official 80B Q4_K_M GGUF is about 48.4 GB before KV cache and runtime overhead: 64 GB is a boundary test, while 96 GB or more is the provisional full-catalogue target. The real support matrix must be generated from clean physical-device runs and recorded per model, workload, app version, runtime version, chip, RAM, and macOS build.
 
@@ -423,9 +382,10 @@ All options below exclude model weights.
 
 | Option | User experience | Advantages | Costs and risks | Verdict |
 |---|---|---|---|---|
-| Dependency-complete DMG | Large download; works without downloading Python packages | Simplest first run; reproducible if signed and locked | Multi-GB likely; duplicate Comfy/Torch runtime; slow updates; every dependency change replaces the DMG | Offer later as a secondary offline artifact |
-| Thin source app using system Python | Small DMG; installs packages on first run | Small initial file | Python is not guaranteed, wrong version/architecture is common, live `pip` is nondeterministic, needs build tools | Reject |
-| Thin signed bootstrap + owned runtime packs | Small DMG; guided first-run dependency download | “Just works,” deterministic, resumable, updateable, excludes CUDA and unused packs | Requires a runtime manifest/update service and careful signing | **Recommended primary release** |
+| Dependency-complete DMG | Large download; works without downloading Python packages | Simplest first run | Multi-GB likely; duplicate Comfy/Torch runtime; slow updates | Offer later as the offline artifact |
+| Thin source app using system Python | Small DMG; installs packages on first run | Small initial file | Python is not guaranteed and may have the wrong version or architecture | Reject |
+| Signed app + app-owned Python + normal venv/pip | Guided first-run dependency installation | Simple, conventional, easy to debug, excludes CUDA and model weights | First launch needs internet and wheel compatibility must be tested | **Recommended primary release** |
+| Custom signed dependency-pack/update system | Controlled binary snapshots and rollback | Strongest control | Considerable engineering before it provides user value | Defer unless normal locked pip installation proves inadequate |
 | Rewrite to remove Python/ML dependencies | Potentially smaller shell | Maximum native integration in the long term | Very high effort, duplicates mature ML stacks, threatens feature/model parity | Reject for release 1.0 |
 
 A dependency-complete DMG does not need CUDA and should not include it “just in case.” CUDA has no execution role on Apple Silicon. Linux CUDA support remains in source manifests and Linux CI.
@@ -434,14 +394,14 @@ A dependency-complete DMG does not need CUDA and should not include it “just i
 
 ```mermaid
 flowchart TD
-    D["Signed + notarized online DMG"] --> A["Image GUI.app — native arm64 launcher, UI assets, app source, signed manifest"]
+    D["Signed + notarized online DMG"] --> A["Image GUI.app — native arm64 launcher + app source"]
     A --> H["Hardware / OS / disk preflight"]
-    H --> R["Runtime manager"]
-    R --> C["Core pack — CPython 3.12, Tcl/Tk, Torch MPS, app Python dependencies"]
-    R --> F["Comfy pack — isolated pinned ComfyUI runtime + direct API workflow"]
-    R --> V["GGUF engine pack — project-built and signed llama.cpp Metal"]
-    R --> U["Upscaler adapter — audited RRDBNet + tiling implementation"]
-    C --> P["Application child processes"]
+    H --> R["App-owned CPython 3.12"]
+    R --> C["Create venv under Application Support"]
+    C --> I["pip install exact hashed macOS lock from PyPI"]
+    I --> P["Application child processes"]
+    R --> F["Optional Anima branch — separate ComfyUI venv"]
+    R --> V["Qwen GGUF helper — llama.cpp Metal"]
     F --> L["Loopback ComfyUI child process"]
     P --> S["User-selected model store — never in the app or DMG"]
     L --> S
@@ -452,14 +412,13 @@ flowchart TD
 
 | Artifact | Contains | Explicitly excludes |
 |---|---|---|
-| Online DMG | Native launcher/updater, icons/assets, app source, bootstrap trust keys, initial manifest, licenses/notices | Python environment, CUDA, model checkpoints |
-| Core runtime pack | Relocatable CPython 3.12 arm64, Tcl/Tk, core Python wheels, Torch MPS, packaged FFmpeg/PortAudio, frozen lock metadata | CUDA/NVIDIA libraries, model checkpoints, live `pip` resolution |
-| Comfy pack | Audited ComfyUI source, isolated locked runtime, and direct API workflow contract | Anima checkpoints, custom-node bundles, ComfyScript default extras, and other model weights |
-| GGUF engine pack | Project-built and signed `llama.cpp` Metal engine from pinned source | Qwen checkpoint files and network-fetched install scripts |
-| Upscaler pack or core adapter | Audited self-contained RRDBNet/tiling implementation for the existing Real-ESRGAN x4plus model | BasicSR live source patches, unused face-restoration dependencies, and the upstream-sourced checkpoint itself |
-| Offline-dependencies DMG | The same launcher plus all dependency packs | Every model checkpoint |
+| Online DMG | Native launcher, icons/assets, app source, exact lockfiles, licenses, and either the small Python runtime or its fixed download metadata | CUDA and model checkpoints |
+| Main venv | Stable PyPI wheels installed from the tested macOS lock, including Torch MPS and ordinary media wheels | CUDA/NVIDIA libraries and model checkpoints |
+| Optional Comfy venv | ComfyUI source and its tested locked Python requirements | Anima checkpoints and unrelated model weights |
+| GGUF helper | Pinned `llama.cpp` Metal executable/library | Qwen checkpoint files |
+| Offline-dependencies DMG | The same app/Python plus a local wheelhouse for the exact locks | Every model checkpoint |
 
-The precise online-DMG and pack sizes should be published only after building them on a clean Mac and recording compressed and installed sizes. The source is negligible; Torch and native ML/media wheels dominate.
+The precise online-DMG and installed-venv sizes should be published only after building them on a clean Mac. The source is negligible; Torch and the ML/media wheels dominate.
 
 ### Why system Python is not acceptable
 
@@ -473,40 +432,28 @@ Using an existing Python creates failures that the application cannot control:
 - Homebrew/Conda locations move and are not owned by the app.
 - Uninstalling or upgrading the user's Python can break the application.
 
-The online-first design still avoids placing Python in the small DMG: it downloads an app-owned, pinned CPython runtime on first launch. There should be exactly one supported Python minor version per release, not multiple versions per M-series chip.
+The app may include Python in the DMG or download one fixed app-owned runtime on first launch. Either is straightforward. There should be exactly one supported Python minor version per release, not multiple versions per M-series chip.
 
-### Runtime pack format and installation
+### Virtual-environment installation
 
-Use versioned, content-addressed archives, for example:
+The first-release mechanism can be conventional:
 
-```text
-manifest-v1.json
-├── core-macos15-arm64-py312-<sha256>.tar.zst
-├── comfy-macos15-arm64-py312-<sha256>.tar.zst
-├── gguf-metal-macos15-arm64-<sha256>.tar.zst
-└── upscaler-macos15-arm64-py312-<sha256>.tar.zst
+```shell
+python3.12 -m venv "$APP_SUPPORT/venv"
+"$APP_SUPPORT/venv/bin/python" -m pip install \
+  --require-hashes \
+  --only-binary=:all: \
+  -r requirements-macos.lock
 ```
 
-Each manifest entry should contain the application version range, exact component versions, architecture, minimum OS, compressed bytes, installed bytes, SHA-256, signature, license-notice reference, and health-check command/result schema.
-
-Installation should:
-
-1. Download to a temporary `.partial` file with range-request resume support.
-2. Verify expected length, SHA-256, and an offline-verifiable project signature.
-3. Extract to a new versioned directory.
-4. Validate architecture, code signatures, imports, MPS availability, and a tiny non-model tensor operation.
-5. Atomically switch a `current` pointer or small state file.
-6. Keep the previous known-good version for rollback.
-7. Never run `pip` against public indexes on an end user's machine.
-
-Every Mach-O executable and dylib in a downloaded pack must be signed, and the distribution container needs an Apple-compatible notarization strategy. The bootstrap's cryptographic signature is an additional supply-chain control; it does not replace Developer ID signing and notarization.
+The lock contains exact versions and hashes. `pip` downloads normal stable wheels from PyPI; it does not choose versions or build source distributions. The offline DMG runs the same command with `--no-index --find-links <wheelhouse>`. Repair can simply recreate the venv without touching models or user data. A custom runtime-pack updater is unnecessary unless measurements later show a concrete need.
 
 ### Packaging technology choice
 
 Two implementation spikes are worthwhile:
 
-1. **Relocatable embedded CPython runtime (preferred):** build CPython 3.12 and all wheels on an Apple Silicon CI runner, place them in a versioned runtime directory, and have the Swift launcher invoke that interpreter against source in the app bundle. This matches optional packs and atomic updates best.
-2. **PyInstaller one-folder `.app` (fallback):** PyInstaller supports native `arm64` targets and code signing, but its static analysis needs extensive hooks for this codebase's dynamic model imports, and a monolithic frozen graph makes optional packs and small updates harder. Avoid one-file extraction for multi-gigabyte ML runtimes.
+1. **App-owned CPython + venv (preferred):** include or download one CPython 3.12 `arm64` runtime, create the venv in Application Support, and install the tested locks with pip.
+2. **PyInstaller one-folder `.app` (fallback):** PyInstaller supports native `arm64` targets and code signing, but its static analysis needs extensive hooks for this codebase's dynamic imports and makes ordinary pip-based repair harder. Avoid one-file extraction for a large ML runtime.
 
 PyInstaller builds for the current platform/architecture and documents Apple Silicon `arm64` and `universal2` behavior; see its [macOS feature notes](https://pyinstaller.org/en/stable/feature-notes.html). Because Intel is out of scope, a larger universal2 artifact offers no benefit.
 
@@ -523,33 +470,30 @@ PyInstaller builds for the current platform/architecture and documents Apple Sil
 ### Split by platform or feature
 
 - Move `nvidia-ml-py`, vLLM CUDA, NVIDIA packages, and CUDA-specific tooling out of shared requirements.
-- Make a project-built `llama.cpp` Metal binary the Mac-only GGUF engine pack. Keep Linux vLLM independent.
-- Make ComfyUI a separately versioned, isolated pack even if first-run setup installs it by default.
+- Add `llama.cpp` Metal as the Mac-only helper for the one GGUF model. Keep Linux vLLM independent.
+- Keep ComfyUI in a separate venv because Anima is its only consumer.
 - Treat BitsAndBytes MPS as a provisional feature pack until exact quantized paths pass. A resolver finding a wheel is not sufficient evidence for a release-critical accelerator.
 - Confirm whether TorchAudio is required by the locked Comfy graph. No direct first-party import was found; keep it only in the environment whose executed workflow proves it needs it.
-- Put FFmpeg and PortAudio binaries behind app-owned paths. Build them from pinned official source in CI if first-party binary provenance cannot be established to the project's standard.
+- Use the pinned `imageio-ffmpeg` and SoundDevice wheels and resolve their included FFmpeg/PortAudio payloads explicitly.
 
 ### Remove, replace, or refuse for release 1.0
 
 | Current dependency/path | Decision | Reason and replacement |
 |---|---|---|
-| `vllm-metal` | **Do not ship** | Its supported installation is a network shell script, its default channel is development, and some relevant features remain experimental. Use project-built `llama.cpp` Metal for the official Qwen GGUF. Reconsider only after vLLM offers a stable, conventional, reproducible release artifact that passes this project's gates. |
+| `vllm-metal` | **Do not ship for now** | Its supported installation is a network shell script and its default channel is development. Use `llama.cpp` Metal for the official Qwen GGUF. |
 | `comfy-script[default]` | **Remove** | The app disables custom nodes but installs a broad third-party extra in both environments. Submit workflow JSON and query history/results through ComfyUI's direct loopback API. |
-| BasicSR 1.4.2 + Real-ESRGAN 0.3.0 installer patch | **Replace** | The graph has no binary-only resolution and is patched during setup. Implement the small RRDBNet/tiling/inference surface needed for the same Real-ESRGAN x4plus model, or maintain a reviewed project fork built in CI. Use the upstream author release for the unchanged checkpoint and do not silently drop the model. |
-| `opencv-python` community wheel | **Do not consume as-is** | The code also asks for `cv2.saliency`, which belongs to Contrib rather than the declared wheel. Replace straightforward image/video operations with Pillow, NumPy, or PyAV and audit the remaining algorithms; if OpenCV is still needed, build a minimal OpenCV/Contrib artifact from official source and sign it. |
-| Duplicate `imageio-ffmpeg`, PyAV, and PATH FFmpeg paths | **Consolidate** | Select one signed FFmpeg build and one application resolver. Keep PyAV only where its in-process API is used, and remove redundant wrappers after call-site tests. |
-| Live PyPI/GitHub installation | **Refuse** | Resolution and compilation happen in release CI, never on an end-user Mac. Runtime packs contain only admitted, hashed, scanned, signed outputs. |
+| Unpinned installs or source builds during setup | **Refuse** | `pip install` is the correct mechanism, but it should consume exact hashed locks and binary wheels rather than resolving new versions or compiling on the user's Mac. |
 
-The upscaler change and direct Comfy API integration are dependency-stack redesigns, but they are narrow boundary changes rather than functionality removals. The model identifiers, workflows, checkpoints, and user-visible features remain.
+Real-ESRGAN and its patched BasicSR installer were removed. No other model has been removed.
 
 ### Artifact source rule
 
-“Available on PyPI” is not an admission criterion. The release build may use PyPI as a transport only when the file is an exact upstream-published stable artifact and its provenance, hash, license, architecture, and contents have been reviewed. Otherwise the project should build from the dependency's official tagged source on controlled Apple Silicon CI. In both cases, the public artifact is copied into an immutable project-controlled build input store; users download only the project's signed runtime pack.
+“Available on PyPI” is a normal starting point, not a problem. The release should use stable wheels from established projects, pin exact versions and hashes, and test the resolved environment on Apple Silicon. Source builds or custom mirroring are fallback measures for packages without suitable wheels, not the default.
 
 The release therefore has two trust boundaries:
 
-1. **Build-time inputs:** pinned upstream source or upstream-owned stable wheels, verified in CI and retained with provenance.
-2. **End-user inputs:** a notarized DMG plus project-signed, content-addressed packs. There is no package resolver, compiler, arbitrary post-install hook, or third-party binary host in the installation path.
+1. **Build/test time:** resolve the macOS dependency set, generate hashes, and prove installation and inference on supported Macs.
+2. **End-user install time:** create the venv and let pip fetch only the already-locked wheels. There is no compiler, arbitrary Git dependency, or fetched shell installer.
 
 ### Lock, do not merely pin top-level packages
 
@@ -588,7 +532,7 @@ model adapter
 └── smoke-test workload
 ```
 
-This does not remove functionality. It prevents one newly introduced Diffusers class, audio library, Comfy component, or CUDA-only telemetry package from stopping unrelated models from launching. It also allows the bootstrap to determine exactly which dependency pack is required for a selected model.
+This prevents one newly introduced Diffusers class, audio library, Comfy component, or CUDA-only telemetry package from stopping unrelated models from launching. It also makes genuine optional dependencies visible without inventing a separate packaging system.
 
 ## Model storage and download design
 
@@ -603,7 +547,7 @@ The model store deserves first-class product work because it can be two orders o
 - Keep `.partial` files separate, resume HTTP downloads, verify upstream checksums/ETags where available, and recover from interruption.
 - Track references so shared checkpoints/tokenizers are not duplicated and deleting one model does not remove data used by another.
 - Provide per-model delete, “reveal in Finder,” move-store, repair, and verify actions.
-- Treat the three Anima checkpoints and the Real-ESRGAN checkpoint exactly like every other model asset: separate from code and dependency packs. Migrate the Real-ESRGAN x4plus download from the current mirror to the model author's release asset after verifying that the bytes and expected network are unchanged.
+- Treat the three Anima checkpoints exactly like every other model asset: separate from code and Python environments.
 - Never delete a user's model store during application uninstall or runtime rollback without a separate, explicit confirmation.
 
 ### Recommended filesystem layout
@@ -616,8 +560,7 @@ The model store deserves first-class product work because it can be two orders o
 ├── runtimes/
 │   ├── core/<version>/
 │   ├── comfy/<version>/
-│   ├── gguf/<version>/
-│   └── upscaler/<version>/
+│   └── gguf/<version>/
 ├── models/                                         # default; user can relocate
 ├── state/
 │   ├── installation.json
@@ -648,13 +591,12 @@ For direct distribution outside the Mac App Store:
 
 Apple requires Developer ID signing, hardened runtime, secure timestamps, and valid signatures for notarized software. DMG is a supported direct-distribution container. Sources: [Apple distribution overview](https://developer.apple.com/macos/distribution/), [notarization requirements](https://developer.apple.com/documentation/security/notarizing-macos-software-before-distribution), and [packaging Mac software](https://developer.apple.com/documentation/xcode/packaging-mac-software-for-distribution).
 
-The updater/runtime manager must also defend its own supply chain:
+The environment bootstrap must also defend its dependency inputs:
 
-- Ship the public verification key in the signed app.
-- Fetch manifests over TLS from a project-controlled origin.
-- Sign immutable manifests and packs; verify before extraction.
-- Reject path traversal, symlinks escaping the target, wrong architecture, and unexpected executable files.
-- Pin all dependency sources and retain build provenance/SBOM.
+- Ship the exact lockfile inside the signed app and require every wheel hash.
+- Let pip fetch the locked wheels over TLS from PyPI, or from the bundled offline wheelhouse.
+- Reject source distributions, wrong-architecture wheels, and packages absent from the lock.
+- Retain the resolved dependency list, licenses, and SBOM with each release.
 - Pin Hugging Face revisions for executable remote code. Model weight updates can remain user-selectable, but code should not silently change with a branch head.
 - Bind ComfyUI to loopback only and do not expose it to the LAN.
 - Never execute post-install shell scripts fetched directly from the internet.
@@ -666,23 +608,20 @@ Mac artifacts must be produced on native macOS/Apple Silicon CI or controlled bu
 ### Proposed pipeline
 
 1. Resolve/update lockfiles in a reviewable dependency pull request.
-2. Build every native wheel or helper binary on a pinned Apple Silicon runner.
-3. Run license policy, malware, vulnerability, and SBOM generation over the exact artifact.
-4. Assemble each versioned dependency pack without contacting public package indexes.
-5. Sign every Mach-O component and the native launcher.
-6. Run static import and pack health checks.
-7. Install into a clean user account and run model-free bootstrap tests.
-8. Run per-model smoke tests using a pre-provisioned model cache on physical representative Macs.
-9. Build and sign the `.app`, create/sign the DMG, notarize, staple, and assess with Gatekeeper.
-10. Publish the immutable packs and signed manifest, then publish the DMG.
-11. Test upgrade, interrupted download, corrupted download, rollback, and uninstall while retaining the model store.
+2. On native Apple Silicon CI, create a clean venv and install the lock from PyPI with `--require-hashes --only-binary=:all:`.
+3. Run license, vulnerability, SBOM, import, and `pip check` validation over that environment.
+4. Run model-free bootstrap tests in a clean user account.
+5. Run the same installation from a local wheelhouse to validate the offline DMG path.
+6. Run per-model smoke tests using a pre-provisioned model cache on physical representative Macs.
+7. Build and sign the `.app`, create/sign the DMG, notarize, staple, and assess with Gatekeeper.
+8. Test failed installation, repair by venv recreation, upgrade, and uninstall while retaining the model store.
 
 Linux CI should independently install from the Linux CUDA lock, run the existing dual-GPU paths, and ensure Mac refactors have not removed CUDA functionality.
 
 ### Artifact verification gates
 
 - `file` reports only expected `arm64` Mach-O binaries.
-- No `nvidia`, CUDA, ELF/Linux native object, or Rosetta-only `x86_64` payload occurs in the Mac packs. Native macOS Python extensions may still use a `.so` suffix and must be identified by binary format, not extension alone.
+- No `nvidia`, CUDA, ELF/Linux native object, or Rosetta-only `x86_64` payload occurs in the Mac venv. Native macOS Python extensions may still use a `.so` suffix and must be identified by binary format, not extension alone.
 - No model checkpoints occur in an artifact (`.safetensors`, `.gguf`, `.ckpt`, or model-weight `.bin`/`.pth` files), except tiny explicit test fixtures approved by policy. The check must distinguish checkpoint `.pth` files from Python path-configuration files with the same suffix.
 - No absolute build-machine paths remain in launchers, RPATHs, shebangs, or metadata.
 - A fresh Mac without Homebrew, Python, Xcode, FFmpeg, or model cache completes setup.
@@ -723,9 +662,9 @@ The lab does not need all 27 hardware qualification groups for every commit. Bef
 
 Every launcher-visible model needs a machine-readable test record proving:
 
-1. The signed pack installs offline after its download, and dependency/import probes succeed without Homebrew, Xcode, system Python, public PyPI, or GitHub.
-2. The checkpoint is found or downloaded outside the application and runtime packs; its upstream repo, revision, file hashes, license/gating state, and byte count are recorded.
-3. The selected plan matches the device and does not silently use CUDA, Rosetta, an unintended CPU-only path, or an undeclared dependency pack.
+1. The app creates its venv and installs the locked wheels successfully from both PyPI and the offline wheelhouse, without Homebrew, Xcode, or system Python.
+2. The checkpoint is found or downloaded outside the application and venv; its upstream repo, revision, file hashes, license/gating state, and byte count are recorded.
+3. The selected plan matches the device and does not silently use CUDA, Rosetta, or an unintended CPU-only path.
 4. The model loads in a fresh child process. Any `PYTORCH_ENABLE_MPS_FALLBACK=1` execution is traced so CPU fallback is explicit and assessed for correctness and usability.
 5. One canonical inference completes at the application's real default settings, followed by one representative stress workload for image/video models.
 6. Output can be opened/saved and passes model-appropriate structural and numerical/semantic checks against a reviewed reference range; a visually plausible result alone is not sufficient.
@@ -743,21 +682,20 @@ The existing unit suite is useful but insufficient. At assessment time, 33 direc
 ### Phase 0 — make the graph reproducible
 
 - Choose CPython 3.12 and macOS 15 as the initial release ABI.
-- Add hashed lockfiles for Mac core, Comfy, GGUF, and upscaler packs plus Linux CUDA/CPU.
+- Add hashed lockfiles for the Mac main and optional Comfy venvs plus Linux CUDA/CPU.
 - Add a project license, third-party notices policy, and automated SBOM.
 - Fix `pip check` and align Torch family versions in each environment.
-- Formalize the dependency admission policy: stable upstream only; no nightlies, development channels, community binary mirrors, live resolvers, or fetched shell installers.
-- Build native components from pinned official source when an upstream-owned wheel is unavailable or does not meet provenance requirements.
-- Restrict first-party validation to tracked source while separately scanning the frozen dependency packs.
+- Formalize the dependency policy: stable PyPI wheels with exact hashes; no nightlies, arbitrary Git dependencies, surprise source builds, or fetched shell installers.
+- Restrict first-party validation to tracked source while separately checking the installed venv.
 - Establish clean Apple Silicon build hardware and Developer ID/notarization credentials.
 
-**Exit condition:** a clean Mac CI job can reproduce identical dependency packs without resolving from mutable version ranges.
+**Exit condition:** a clean Mac CI job can recreate a passing venv from the lock without resolving mutable version ranges.
 
 ### Phase 1 — make the application bundle-safe
 
 - Introduce platform-correct Application Support, Caches, Logs, model-store, and output paths.
 - Replace every `xdg-open` call.
-- Route FFmpeg to the app-built signed executable and SoundDevice to the app-owned PortAudio build.
+- Route FFmpeg through `imageio_ffmpeg.get_ffmpeg_exe()` and keep the pinned SoundDevice wheel.
 - Lazy-load NVML, audio, Diffusers pipelines, `flex_attention`, Comfy, and the platform-specific language engine.
 - Add native architecture, OS, RAM, and disk preflight APIs.
 - Make model-cache selection and migration a first-class settings flow.
@@ -767,23 +705,21 @@ The existing unit suite is useful but insufficient. At assessment time, 33 direc
 
 ### Phase 2 — close model backend gaps
 
-- Implement the audited Real-ESRGAN RRDBNet/tiling adapter with CPU and MPS paths using the same x4plus model, migrating checkpoint acquisition to the upstream author release and recording its hash.
-- Integrate project-built `llama.cpp` Metal against the exact official Qwen3 Coder Q4_K_M GGUF. `vllm-metal` is excluded from the production design unless its release process later satisfies the admission policy.
+- Integrate a pinned stable `llama.cpp` Metal release against the exact official Qwen3 Coder Q4_K_M GGUF. Build it only if the upstream macOS artifact is unsuitable.
 - Validate Anima/ComfyUI on MPS.
 - Validate BitsAndBytes operations used by each quantized path on MPS; provide model-specific alternatives where necessary.
 - Add revisions/hashes for executable Hugging Face remote code.
-- Eliminate or project-build OpenCV after call-site replacement analysis.
+- Keep the pinned `opencv-contrib-python` wheel and test its saliency, cascade, colour, and video paths on Mac.
 
 **Exit condition:** every launcher model has at least one implemented Mac backend path and a declared minimum test tier.
 
 ### Phase 3 — build the product installer
 
-- Build the native Swift/SwiftUI bootstrap and runtime manager.
-- Produce signed, versioned core and optional packs.
-- Add progress, resume, integrity checking, atomic activation, rollback, repair, and uninstall.
+- Build the native Swift/SwiftUI bootstrap around app-owned Python, `venv`, and pip.
+- Add first-run progress, clear pip errors, venv recreation/repair, and uninstall.
 - Move all writes out of the app bundle.
 - Assemble the signed/notarized online DMG.
-- Generate the offline-dependencies DMG from the exact same packs.
+- Generate the offline-dependencies DMG from the exact same lock and wheelhouse.
 
 **Exit condition:** a clean supported Mac can install and launch without Terminal or preinstalled developer tools, with zero model weights in either artifact.
 
@@ -801,31 +737,30 @@ The existing unit suite is useful but insufficient. At assessment time, 33 direc
 
 1. Freeze the admission policy, add Mac/Linux lock inputs, align the Torch family, and select one CPython 3.12 patch release.
 2. Establish native Apple Silicon build hosts, the Apple7–10 physical test lanes, and Developer ID/notarization credentials.
-3. Prototype a relocatable CPython core pack and minimal native launcher from controlled build inputs.
+3. Prototype the app-owned CPython, normal venv, pinned pip-install flow, and minimal native launcher.
 4. Move writable state out of the repository/application directory and add model-store disk management.
-5. Add a platform service for opening files/folders and resolving signed packaged helper binaries.
-6. Make every optional, platform-specific, and model-specific import lazy; split CUDA/NVML, Mac GGUF, Comfy, and upscaler groups.
-7. Replace ComfyScript, the patched BasicSR chain, and the PATH-based FFmpeg path; eliminate or self-build OpenCV.
-8. Implement the `llama.cpp` Qwen path and audited x4plus upscaler path without changing model weights.
-9. Pin executable remote code and implement immutable pack provenance, SBOM, signature, repair, and rollback.
+5. Add a platform service for opening files/folders and resolving installed helper binaries.
+6. Make every optional, platform-specific, and model-specific import lazy; split CUDA/NVML, Mac GGUF, and Comfy requirements.
+7. Replace ComfyScript and the PATH-based FFmpeg lookup; install `opencv-contrib-python` instead of the wrong OpenCV wheel.
+8. Implement the `llama.cpp` Qwen path.
+9. Pin executable remote code and implement lockfile/SBOM recording plus venv repair.
 10. Run and publish the per-model acceptance ledger before making an all-model compatibility claim.
 
 ## Decisions still needed from the maintainers
 
 - Product name and reverse-DNS bundle identifier.
 - Apple Developer team and secure signing/notarization credential ownership.
-- Whether the primary first launch installs all dependency packs immediately or installs feature packs when first selected. Either can still “just work”; installing all packs gives a longer first setup, while on-demand packs reduce disk use.
+- Whether the first launch also creates the optional Anima/Comfy venv or waits until Anima is selected.
 - Whether 8 GB is marketed as “supported with a limited model set” or the public minimum is 16 GB. The app should still fail gracefully on 8 GB either way.
 - Default model-store location and the external-volume user experience.
 - Whether BitsAndBytes MPS passes the production gate for every currently quantized path, or which model-specific official-format fallback each failed path receives.
-- Whether remaining OpenCV functionality is small enough to replace or warrants a project-built minimal OpenCV/Contrib artifact.
 - Project licensing and GPL-3.0 compliance strategy for distributed ComfyUI code.
-- Hosting, signing-key rotation, retention, and rollback policy for runtime manifests and packs.
+- Whether the online installer uses public PyPI directly or a project-controlled wheel cache; both consume the same hashes.
 
 ## Final recommendation
 
-Do not redesign the whole ML application and do not depend on system Python. Build one native Apple Silicon bootstrap, give it an app-owned CPython 3.12 runtime, and distribute locked, signed dependency packs selected for macOS 15 `arm64`. Keep the stable Python/PyTorch/Diffusers/Transformers core, retain Linux/CUDA in separate locks, use project-built `llama.cpp` for the Mac GGUF path, replace ComfyScript with the direct ComfyUI API, and replace the patched BasicSR installer with an audited upscaler adapter. Treat BitsAndBytes MPS as provisional until physical tests admit it.
+Do not redesign the ML application and do not depend on system Python. Give the signed Apple Silicon app one owned CPython 3.12 runtime, create a normal venv under Application Support, and use pip to install an exact hashed macOS lock made from stable wheels. Keep the Python/PyTorch/Diffusers/Transformers core, retain Linux/CUDA in separate locks, use `llama.cpp` only for the Mac GGUF model, and keep Comfy isolated while Anima remains. Real-ESRGAN and its patched installer have been removed; OpenCV remains as the normal `opencv-contrib-python` dependency.
 
-This recommendation deliberately refuses experimental installers and opaque community binaries. It does not pretend that the current repository already works everywhere: artifact resolution is encouraging, but all-model support remains gated on real Apple7, Apple8, Apple9, and Apple10 executions. If a dependency cannot cross that gate using an official stable release or a reproducible build from official source, the correct response is to replace that dependency boundary—not weaken the release standard or remove the model.
+This recommendation refuses experimental installers without distrusting ordinary packaging. PyPI, venv, and pip are the default solution. The remaining catalogue still requires real Apple7, Apple8, Apple9, and Apple10 testing before an all-model claim.
 
-Most importantly, keep **runtime distribution** and **model distribution** as separate systems. The DMG solves application trust and bootstrapping. Runtime packs solve Python/native dependency reproducibility. The model store solves a potentially 600 GB user-data lifecycle. Combining those concerns would make installation, updates, signing, and storage management substantially worse.
+Most importantly, keep the Python environment and model store separate. The DMG bootstraps Python and the venv; the model store manages potentially 600 GB of user data. No model weights belong in either DMG variant.

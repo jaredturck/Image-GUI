@@ -30,7 +30,6 @@ MODELS = [
     ('ChronoEdit (14B)', 'chronoedit', 'image', '14B'),
     ('Qwen Image Edit (20B 4bit)', 'qwen_image_edit', 'image', '30B'),
     ('BRIA RMBG 1.4 (Remove BG)', 'rmbg_1_4', 'image', '44M'),
-    ('Real-ESRGAN (Upscale)', 'real_esrgan', 'image', '16.7M'),
     ('SD x4 Upscaler', 'sd_x4_upscaler', 'image', '1.1B'),
 
     ('SkyReels V2', 'skyreels_v2', 'video', '1.3B'),
@@ -100,7 +99,6 @@ MODEL_PREVIEW_DIRS = {
     "chronoedit": "chronoedit/",
     "qwen_image_edit": "qwen_image_edit/",
     "rmbg_1_4": "rmbg_1_4/",
-    "real_esrgan": "real_esrgan/",
     "sd_x4_upscaler": "sd_x4_upscaler/",
 
     "skyreels_v2": "skyreels_v2/",

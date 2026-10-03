@@ -22,7 +22,6 @@ OUTPUT_DIRECTORY_MAP = {
     "chronoedit": ("images", "chronoedit"),
     "qwen_image_edit": ("images", "qwen_image_edit"),
     "rmbg_1_4": ("images", "rmbg_1_4"),
-    "real_esrgan": ("images", "real_esrgan"),
     "sd_x4_upscaler": ("images", "sd_x4_upscaler"),
     "skyreels_v2": ("videos", "skyreels_v2"),
     "kandinsky_tv2_lite": ("videos", "kandinsky_5_t2v"),

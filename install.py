@@ -21,13 +21,6 @@ COMFYUI_VERSION = "v0.28.0"
 COMFYUI_ARCHIVE_URL = f"https://github.com/Comfy-Org/ComfyUI/archive/refs/tags/{COMFYUI_VERSION}.zip"
 COMFY_SCRIPT_SPEC = "comfy-script[default]"
 
-BASICSR_VERSION = "1.4.2"
-BASICSR_ARCHIVE_URL = (
-    f"https://github.com/XPixelGroup/BasicSR/archive/refs/tags/v{BASICSR_VERSION}.zip"
-)
-REALESRGAN_SPEC = "realesrgan==0.3.0"
-
-
 class InstallerApp:
     def __init__(self):
         self.base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -46,8 +39,6 @@ class InstallerApp:
         self.main_ready = False
         self.comfy_ready = False
         self.comfy_skipped = False
-        self.realesrgan_ready = False
-        self.realesrgan_message = "Not installed"
         self.missing_prerequisites = self.detect_external_prerequisites()
 
         self.root = tk.Tk()
@@ -533,7 +524,7 @@ class InstallerApp:
             requirement_files = self.requirements_files()
             total = len(requirement_files)
             requirements_start = 15.0
-            requirements_end = 76.0
+            requirements_end = 90.0
             requirements_span = requirements_end - requirements_start
 
             for index, requirement_file in enumerate(requirement_files, start=1):
@@ -564,32 +555,6 @@ class InstallerApp:
                     f"Finished {requirement_file} ({index} of {total})",
                 )
 
-            self.queue_progress(
-                "main",
-                78,
-                "Installing optional Real-ESRGAN upscaler support...",
-            )
-            self.realesrgan_ready = self.install_realesrgan_support(main_python)
-            if self.realesrgan_ready:
-                self.realesrgan_message = "Ready"
-                self.write_installation_state("realesrgan", "ready")
-                self.queue_progress("main", 92, "Real-ESRGAN support ready")
-            else:
-                self.realesrgan_message = "Unavailable"
-                self.write_installation_state("realesrgan", "unavailable")
-                self.output_queue.put(
-                    (
-                        "main_log",
-                        "\nReal-ESRGAN support could not be installed. "
-                        "The rest of the AI Workstation will remain available.\n",
-                    )
-                )
-                self.queue_progress(
-                    "main",
-                    92,
-                    "Continuing without Real-ESRGAN support...",
-                )
-
             self.queue_progress("main", 95, "Validating the application environment...")
             verification = (
                 "import customtkinter; import torch; import transformers; import diffusers; "
@@ -617,188 +582,6 @@ class InstallerApp:
             message = str(error)
 
         self.output_queue.put(("main_finished", success, message))
-
-    def install_realesrgan_support(self, python_path):
-        verification = (
-            "from basicsr.archs.rrdbnet_arch import RRDBNet; "
-            "from realesrgan import RealESRGANer; "
-            "print('Real-ESRGAN validation passed')"
-        )
-        if self.command_succeeds([python_path, "-c", verification], self.base_dir):
-            self.output_queue.put(
-                ("main_log", "Existing Real-ESRGAN installation passed validation.\n")
-            )
-            return True
-
-        os.makedirs(self.runtime_dir, exist_ok=True)
-        working_dir = tempfile.mkdtemp(
-            prefix="basicsr_install_",
-            dir=self.runtime_dir,
-        )
-        archive_path = os.path.join(working_dir, f"BasicSR-{BASICSR_VERSION}.zip")
-        extract_dir = os.path.join(working_dir, "source")
-
-        try:
-            self.queue_progress(
-                "main",
-                79,
-                f"Downloading BasicSR {BASICSR_VERSION} source...",
-            )
-            if not self.download_archive(
-                BASICSR_ARCHIVE_URL,
-                archive_path,
-                "main",
-                79,
-                83,
-                f"Downloading BasicSR {BASICSR_VERSION}",
-            ):
-                return False
-
-            self.queue_progress("main", 84, "Preparing BasicSR source...")
-            os.makedirs(extract_dir, exist_ok=True)
-            with zipfile.ZipFile(archive_path, "r") as archive:
-                archive.extractall(extract_dir)
-
-            source_dir = self.find_python_source(
-                extract_dir,
-                required_files=["setup.py", "VERSION"],
-            )
-            if not source_dir:
-                self.output_queue.put(
-                    ("main_log", "BasicSR archive did not contain the expected source files.\n")
-                )
-                return False
-
-            if not self.patch_basicsr_source(source_dir):
-                return False
-
-            self.queue_progress("main", 85, "Installing the patched official BasicSR release...")
-            basicsr_command = [
-                python_path,
-                "-m",
-                "pip",
-                "install",
-                "--no-build-isolation",
-                "--progress-bar",
-                "on",
-                source_dir,
-            ]
-            if not self.run_command(basicsr_command, "main", self.base_dir):
-                return False
-
-            self.queue_progress("main", 89, "Installing Real-ESRGAN...")
-            realesrgan_command = [
-                python_path,
-                "-m",
-                "pip",
-                "install",
-                "--no-deps",
-                "--progress-bar",
-                "on",
-                REALESRGAN_SPEC,
-            ]
-            if not self.run_command(realesrgan_command, "main", self.base_dir):
-                return False
-
-            self.queue_progress("main", 91, "Validating Real-ESRGAN...")
-            if not self.run_command(
-                [python_path, "-c", verification],
-                "main",
-                self.base_dir,
-            ):
-                return False
-            return True
-        finally:
-            shutil.rmtree(working_dir, ignore_errors=True)
-
-    def patch_basicsr_source(self, source_dir):
-        setup_path = os.path.join(source_dir, "setup.py")
-        degradation_path = os.path.join(
-            source_dir,
-            "basicsr",
-            "data",
-            "degradations.py",
-        )
-
-        with open(setup_path, "r", encoding="utf-8") as file:
-            setup_text = file.read()
-
-        old_version_code = """def get_version():
-    with open(version_file, 'r') as f:
-        exec(compile(f.read(), version_file, 'exec'))
-    return locals()['__version__']
-"""
-        new_version_code = """def get_version():
-    namespace = {}
-    with open(version_file, 'r') as f:
-        exec(compile(f.read(), version_file, 'exec'), namespace)
-    return namespace['__version__']
-"""
-
-        if old_version_code in setup_text:
-            setup_text = setup_text.replace(old_version_code, new_version_code)
-            with open(setup_path, "w", encoding="utf-8") as file:
-                file.write(setup_text)
-            self.output_queue.put(
-                (
-                    "main_log",
-                    "Applied the Python 3.13+ BasicSR version-reader compatibility patch.\n",
-                )
-            )
-        elif new_version_code not in setup_text:
-            self.output_queue.put(
-                (
-                    "main_log",
-                    "BasicSR setup.py did not match the pinned source layout.\n",
-                )
-            )
-            return False
-
-        if not os.path.isfile(degradation_path):
-            self.output_queue.put(
-                ("main_log", "BasicSR degradation module was not found.\n")
-            )
-            return False
-
-        with open(degradation_path, "r", encoding="utf-8") as file:
-            degradation_text = file.read()
-
-        old_import = (
-            "from torchvision.transforms.functional_tensor import rgb_to_grayscale"
-        )
-        new_import = "from torchvision.transforms.functional import rgb_to_grayscale"
-
-        if old_import in degradation_text:
-            degradation_text = degradation_text.replace(old_import, new_import)
-            with open(degradation_path, "w", encoding="utf-8") as file:
-                file.write(degradation_text)
-            self.output_queue.put(
-                (
-                    "main_log",
-                    "Applied the current torchvision compatibility patch to BasicSR.\n",
-                )
-            )
-        elif new_import not in degradation_text:
-            self.output_queue.put(
-                (
-                    "main_log",
-                    "BasicSR torchvision import did not match the pinned source layout.\n",
-                )
-            )
-            return False
-
-        return True
-
-    def find_python_source(self, extract_dir, required_files):
-        for root, directories, files in os.walk(extract_dir):
-            directory_names = set(directories)
-            file_names = set(files)
-            required_names = set(required_files)
-            if required_names.issubset(file_names):
-                return root
-            if ".git" in directory_names:
-                directories.remove(".git")
-        return None
 
     def download_archive(
         self,
@@ -1255,7 +1038,6 @@ class InstallerApp:
         launch_command = self.command_text([self.main_python(), "gui.py"])
         summary = (
             f"Main application environment: {main_text}\n"
-            f"Real-ESRGAN upscaler: {self.realesrgan_message}\n"
             f"ComfyUI backend: {comfy_text}\n"
             f"External system software: {prerequisites}\n\n"
             f"Main environment: {self.main_venv_dir}\n"

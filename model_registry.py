@@ -346,7 +346,6 @@ LAUNCHER_MODEL_IDS = [
     'chronoedit',
     'qwen_image_edit',
     'rmbg_1_4',
-    'real_esrgan',
     'sd_x4_upscaler',
     'skyreels_v2',
     'kandinsky_5_t2v',
@@ -5954,117 +5953,6 @@ RAW_MODEL_PROFILES = [
             'https://huggingface.co/briaai/RMBG-1.4',
             'https://huggingface.co/briaai/RMBG-1.4/blob/main/config.json',
             'https://huggingface.co/briaai/RMBG-1.4/tree/main'
-        ],
-        'confidence': {
-            'architecture': 'high',
-            'component_weight_memory': 'high',
-            'runtime_peak': 'estimated',
-            'quantization_quality': 'research_policy_and_model_specific_evidence'
-        },
-        'notes': [],
-        'application_source_files': ['model_gui.py']
-    },
-    {
-        'key': 'real_esrgan_x4plus',
-        'model_id': 'lllyasviel/Annotators',
-        'runtime_model_id': 'lllyasviel/Annotators',
-        'launcher_id': 'real_esrgan',
-        'display_name': 'Real-ESRGAN x4plus',
-        'category': 'utility_image_upscale',
-        'task': 'image_upscale',
-        'checkpoint': {
-            'format': 'diffusers_repository',
-            'native_dtype': 'bfloat16_or_component_specific',
-            'already_quantized': False
-        },
-        'architecture': {'family': 'realesrgan_rrdbnet', 'component_count': 1},
-        'components': {
-            'upsampler': {
-                'role': 'super_resolution_network',
-                'architecture': 'rrdbnet_23_block_x4',
-                'parameter_billions': 0.0167,
-                'active_parameter_billions': 0.0167,
-                'native_dtype': 'float16',
-                'quantizable_fraction': 0.05,
-                'checkpoint_storage_gib': 0.063,
-                'checkpoint_storage_basis': 'repository_file_inventory',
-                'phases': ['upscale'],
-                'sharding': 'whole_component',
-                'offload': 'whole_model_cpu_or_gpu',
-                'quantization_support': {
-                    'int8': 'not_recommended_due_convolutional_architecture_and_small_weights',
-                    'int4': 'disabled'
-                },
-                'skip_modules': [],
-                'memory_overrides_gib': {},
-                'confidence': 'high',
-                'evidence': 'architecture_and_checkpoint_metadata',
-                'notes': ['RRDBNet with 64 features, 23 residual-dense blocks, growth channels 32, and scale factor 4.']
-            }
-        },
-        'execution_phases': [
-            {
-                'name': 'upscale',
-                'required_components': ['upsampler'],
-                'dynamic_memory_scales_with': ['input_width', 'input_height', 'outscale', 'tile_size']
-            }
-        ],
-        'default_workload': {
-            'input_max_dimension': 2048,
-            'outscale': 4.0,
-            'tile_size': 0,
-            'batch_size': 1
-        },
-        'runtime_memory': {
-            'dominant_terms': ['convolution_feature_maps', 'output_resolution'],
-            'default_runtime_headroom_gib': 2.0,
-            'workload_scaling': ['input_width', 'input_height', 'outscale'],
-            'weight_quantization_does_not_reduce': [
-                'latents',
-                'attention_workspace',
-                'vae_activations',
-                'most_non_linear_activations'
-            ],
-            'recommended_fallback': 'enable_tiling_before_precision_reduction'
-        },
-        'backend_support': {
-            'cuda': 'supported_by_current_loader',
-            'mps': 'not_supported_by_current_realesrganer_path',
-            'cpu': 'supported_and_practical_for_moderate_images',
-            'bitsandbytes_cuda': False,
-            'comfyui': False
-        },
-        'placement_support': {
-            'single_gpu': True,
-            'multi_gpu_component_placement': False,
-            'multi_gpu_block_sharding': False,
-            'device_map': False,
-            'model_cpu_offload': False,
-            'sequential_cpu_offload': False,
-            'custom_staging': False,
-            'cpu_only': True
-        },
-        'quantization_policy': {
-            'component_specific': True,
-            'int8_auto_allowed': False,
-            'int4_auto_allowed': False,
-            'int4_default_position': 'after_int8_and_native_model_offload',
-            'never_quantize_roles': ['super_resolution_network'],
-            'prefer_text_encoder_int4_over_denoiser_int4': True,
-            'prefer_resident_int8_over_native_sequential_offload': True
-        },
-        'current_code': {'loader': 'RealESRGANer', 'plan': 'single_cuda_gpu_half_precision', 'quantization': 'native'},
-        'existing_fast_path': {
-            'plan_id': 'real_esrgan_current_cuda0_half_precision',
-            'hardware_match': {'backend': 'cuda', 'gpu_count': 1},
-            'loader': 'RealESRGANer',
-            'placement': 'cuda0',
-            'quantization': {'upsampler': 'float16'},
-            'preserve_exact_loader': True
-        },
-        'sources': [
-            'https://github.com/xinntao/Real-ESRGAN',
-            'https://huggingface.co/lllyasviel/Annotators/blob/main/RealESRGAN_x4plus.pth'
         ],
         'confidence': {
             'architecture': 'high',

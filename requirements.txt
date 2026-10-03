@@ -3,7 +3,7 @@ python-dotenv
 Pillow
 cryptography
 numpy
-opencv-python
+opencv-contrib-python
 matplotlib
 transformers
 accelerate
